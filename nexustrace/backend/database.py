@@ -115,6 +115,10 @@ def init_db():
         )
         """
     )
+    if not _column_exists(cursor, "videos", "codec"):
+        cursor.execute("ALTER TABLE videos ADD COLUMN codec TEXT")
+    if not _column_exists(cursor, "videos", "created_at"):
+        cursor.execute("ALTER TABLE videos ADD COLUMN created_at TEXT")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_session_id ON videos(session_id)")
 
     conn.commit()
@@ -353,6 +357,34 @@ def get_latest_video_for_session(session_id: int):
     return dict(row) if row else None
 
 
+def get_video_by_id(video_id: int):
+    ensure_app_dirs()
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM videos WHERE id = ?", (video_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_videos_for_session(session_id: int):
+    ensure_app_dirs()
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, session_id, file_path, codec, created_at
+        FROM videos
+        WHERE session_id = ?
+        ORDER BY id DESC
+        """,
+        (session_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
 def get_sessions_detailed(
     created_by: Optional[int] = None,
     is_admin: bool = False,
@@ -424,12 +456,13 @@ def get_sessions_detailed(
             s.video_path,
             s.started_at,
             s.ended_at,
+            v.id AS resolved_video_id,
             COALESCE(v.file_path, s.video_path) AS resolved_video_path,
             COALESCE(SUM(sp.count), 0) AS products_total_count
         FROM sessions s
         LEFT JOIN session_products sp ON sp.session_id = s.id
         LEFT JOIN (
-            SELECT v1.session_id, v1.file_path
+            SELECT v1.id, v1.session_id, v1.file_path
             FROM videos v1
             WHERE v1.id = (
                 SELECT MAX(v2.id)
@@ -449,6 +482,7 @@ def get_sessions_detailed(
     for row in rows:
         item = dict(row)
         item["products"] = get_session_products(item["id"])
+        item["video_available"] = bool(item.get("resolved_video_path"))
         if item["products"]:
             item["products_label"] = ", ".join(f"{p['product_name']} ({p['count']})" for p in item["products"])
         else:

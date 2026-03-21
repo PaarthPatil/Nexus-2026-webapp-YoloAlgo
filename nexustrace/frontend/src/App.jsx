@@ -8,6 +8,14 @@ const WS_BASE_URL =
     : API_BASE_URL.replace('http://', 'ws://'))
 
 const NAV_ITEMS = ['Dashboard', 'Sessions', 'History', 'Settings']
+const DEFAULT_PROCESSING_OPTIONS = [
+  { value: 'run_yolo.py', label: 'run_yolo.py (YOLOv2 Baseline)' },
+  { value: 'run_yolo2.py', label: 'run_yolo2.py (YOLOv2 Style)' },
+  { value: 'run_yolo3.py', label: 'run_yolo3.py (YOLOv3 Optimized)' },
+  { value: 'run_yolo4.py', label: 'run_yolo4.py (YOLOv4 Optimized)' },
+  { value: 'run_yolo5.py', label: 'run_yolo5.py (YOLOv5 Hysteresis)' },
+  { value: 'run_yoloraspPi.py', label: 'run_yoloraspPi.py (Raspberry Pi)' }
+]
 
 const parseProducts = (value) =>
   String(value || '')
@@ -37,8 +45,11 @@ function App() {
   const [batchId, setBatchId] = useState('')
   const [videoSource, setVideoSource] = useState('')
   const [modelPath, setModelPath] = useState('box_detection.pt')
+  const [processingMode, setProcessingMode] = useState('run_yolo3.py')
+  const [processingOptions, setProcessingOptions] = useState(DEFAULT_PROCESSING_OPTIONS)
+  const [modelOptions, setModelOptions] = useState([])
   const [countMode, setCountMode] = useState('roi_current')
-  const [yolov5RepoPath, setYolov5RepoPath] = useState('D:\\Nexus\\yolov5')
+  const [yolov5RepoPath, setYolov5RepoPath] = useState('')
   const [confThreshold, setConfThreshold] = useState('0.50')
   const [iouThreshold, setIouThreshold] = useState('0.65')
   const [roiPadding, setRoiPadding] = useState('5')
@@ -69,6 +80,11 @@ function App() {
   const [historyOptions, setHistoryOptions] = useState({ operators: [], products: [] })
   const [rowSelectedProducts, setRowSelectedProducts] = useState({})
   const [selectedSessionIds, setSelectedSessionIds] = useState([])
+  const [selectedHistorySessionId, setSelectedHistorySessionId] = useState(null)
+  const [selectedSessionDetails, setSelectedSessionDetails] = useState(null)
+  const [detailsLoading, setDetailsLoading] = useState(false)
+  const [detailsError, setDetailsError] = useState('')
+  const [previewSession, setPreviewSession] = useState(null)
   const [lastSessionId, setLastSessionId] = useState(null)
 
   const [status, setStatus] = useState('')
@@ -137,6 +153,85 @@ function App() {
     }
   }, [historyFilters])
 
+  const getSessionVideoUrl = useCallback(
+    (session) => {
+      if (!session) return ''
+      if (session.video_url) return session.video_url
+      if (session.resolved_video_id) return `${API_BASE_URL}/api/videos/${session.resolved_video_id}`
+      return `${API_BASE_URL}/api/video/${session.id}`
+    },
+    []
+  )
+
+  const getSessionShareUrl = useCallback(
+    (session) => {
+      if (!session) return ''
+      if (session.video_share_url) return session.video_share_url
+      return getSessionVideoUrl(session)
+    },
+    [getSessionVideoUrl]
+  )
+
+  const copyText = useCallback(async (value) => {
+    const text = String(value || '').trim()
+    if (!text) return false
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.focus()
+    textarea.select()
+    try {
+      document.execCommand('copy')
+      return true
+    } finally {
+      document.body.removeChild(textarea)
+    }
+  }, [])
+
+  const fetchSessionDetails = useCallback(
+    async (sessionId) => {
+      if (!sessionId) return
+      setDetailsLoading(true)
+      setDetailsError('')
+      try {
+        const res = await fetch(`${API_BASE_URL}/api/sessions/${sessionId}/details`)
+        if (!res.ok) throw new Error(await parseError(res, `Details failed (${res.status})`))
+        const data = await res.json()
+        setSelectedSessionDetails(data)
+        setSelectedHistorySessionId(sessionId)
+      } catch (err) {
+        setDetailsError(err.message || 'Failed to load session details')
+      } finally {
+        setDetailsLoading(false)
+      }
+    },
+    [parseError]
+  )
+
+  const shareVideo = useCallback(
+    async (session) => {
+      setError('')
+      const link = getSessionShareUrl(session)
+      if (!link) {
+        setError('Video not available for sharing.')
+        return
+      }
+      try {
+        await copyText(link)
+        setStatus(`Video link copied: ${link}`)
+      } catch (_) {
+        setError('Failed to copy video link.')
+      }
+    },
+    [copyText, getSessionShareUrl]
+  )
+
   const fetchCurrentSession = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE_URL}/api/sessions/current`)
@@ -152,6 +247,71 @@ function App() {
       setSessionProducts(session.products || [])
       if (session.operator_id) setOperatorId(session.operator_id)
       if (session.batch_id) setBatchId(session.batch_id)
+    } catch (_) {
+      // no-op
+    }
+  }, [])
+
+  const fetchSessionOptions = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/sessions/options`)
+      if (!res.ok) return
+      const data = await res.json()
+
+      const scriptOptions = (data.runner_scripts || [])
+        .map((item) => {
+          const value = String(item.script_name || '').trim()
+          if (!value) return null
+          const modeLabel = String(item.label || item.mode || '').trim()
+          return {
+            value,
+            label: modeLabel ? `${value} (${modeLabel})` : value
+          }
+        })
+        .filter(Boolean)
+
+      const modeOptions = (data.processing_modes || [])
+        .map((item) => {
+          const value = String(item.value || '').trim()
+          if (!value) return null
+          return {
+            value,
+            label: String(item.label || value).trim()
+          }
+        })
+        .filter(Boolean)
+
+      const nextProcessingOptions = scriptOptions.length ? scriptOptions : modeOptions
+      if (nextProcessingOptions.length) {
+        setProcessingOptions(nextProcessingOptions)
+        setProcessingMode((prev) =>
+          nextProcessingOptions.some((option) => option.value === prev)
+            ? prev
+            : nextProcessingOptions[0].value
+        )
+      }
+
+      const nextModelOptions = (data.model_files || [])
+        .map((item) => {
+          const path = String(item.path || '').trim()
+          if (!path) return null
+          return {
+            value: path,
+            label: String(item.name || path).trim()
+          }
+        })
+        .filter(Boolean)
+
+      setModelOptions(nextModelOptions)
+      if (nextModelOptions.length) {
+        setModelPath((prev) => {
+          if (nextModelOptions.some((option) => option.value === prev)) return prev
+          const matchByName = nextModelOptions.find((option) => option.label === prev)
+          if (matchByName) return matchByName.value
+          if (data.default_model_path) return String(data.default_model_path)
+          return nextModelOptions[0].value
+        })
+      }
     } catch (_) {
       // no-op
     }
@@ -184,6 +344,7 @@ function App() {
   }, [closeWebSocket])
 
   useEffect(() => {
+    fetchSessionOptions()
     fetchStats()
     fetchHistory()
     fetchHistoryOptions()
@@ -193,7 +354,7 @@ function App() {
       clearInterval(timer)
       closeWebSocket()
     }
-  }, [closeWebSocket, fetchCurrentSession, fetchHistory, fetchHistoryOptions, fetchStats])
+  }, [closeWebSocket, fetchCurrentSession, fetchHistory, fetchHistoryOptions, fetchSessionOptions, fetchStats])
 
   useEffect(() => {
     const timeout = setTimeout(() => {
@@ -201,6 +362,15 @@ function App() {
     }, 250)
     return () => clearTimeout(timeout)
   }, [fetchHistory])
+
+  useEffect(() => {
+    if (!selectedHistorySessionId) return
+    const exists = sessions.some((session) => session.id === selectedHistorySessionId)
+    if (!exists) {
+      setSelectedHistorySessionId(null)
+      setSelectedSessionDetails(null)
+    }
+  }, [selectedHistorySessionId, sessions])
 
   useEffect(() => {
     if (isRunning) connectWebSocket()
@@ -224,6 +394,7 @@ function App() {
           batch_id: batchId,
           video_source: videoSource,
           model_path: modelPath,
+          processing_mode: processingMode,
           count_mode: countMode,
           yolov5_repo_path: yolov5RepoPath || null,
           conf_threshold: countMode === 'roi_current' ? Number(confThreshold) : null,
@@ -325,6 +496,9 @@ function App() {
         window.open(`${API_BASE_URL}/api/challans/${sessionId}`, '_blank')
       }
       setStatus(`Challan generated for session ${sessionId}`)
+      if (selectedHistorySessionId === sessionId) {
+        await fetchSessionDetails(sessionId)
+      }
     } catch (err) {
       setError(err.message || 'Failed to generate challan')
     }
@@ -350,6 +524,19 @@ function App() {
     setSelectedSessionIds((prev) =>
       prev.includes(sessionId) ? prev.filter((id) => id !== sessionId) : [...prev, sessionId]
     )
+  }
+
+  const openVideoPreview = (session) => {
+    const url = getSessionVideoUrl(session)
+    if (!url) {
+      setError('Video not available')
+      return
+    }
+    setPreviewSession({ ...session, video_url: url })
+  }
+
+  const selectSessionDetails = async (sessionId) => {
+    await fetchSessionDetails(sessionId)
   }
 
   const productRows = useMemo(
@@ -418,6 +605,10 @@ function App() {
           setVideoSource={setVideoSource}
           modelPath={modelPath}
           setModelPath={setModelPath}
+          processingMode={processingMode}
+          setProcessingMode={setProcessingMode}
+          processingOptions={processingOptions}
+          modelOptions={modelOptions}
           countMode={countMode}
           setCountMode={setCountMode}
           yolov5RepoPath={yolov5RepoPath}
@@ -511,7 +702,8 @@ function App() {
               <th className="text-left p-2">Total</th>
               <th className="text-left p-2">Timestamp</th>
               <th className="text-left p-2">Challan Products</th>
-              <th className="text-left p-2">Action</th>
+              <th className="text-left p-2">Video</th>
+              <th className="text-left p-2">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -543,24 +735,162 @@ function App() {
                     />
                   </td>
                   <td className="p-2">
+                    <div className="flex flex-wrap gap-1">
+                      <button
+                        onClick={() => openVideoPreview(session)}
+                        disabled={!session.video_available}
+                        className="bg-slate-700 hover:bg-slate-600 disabled:opacity-40 px-2 py-1 rounded"
+                      >
+                        View Video
+                      </button>
+                      <button
+                        onClick={() => shareVideo(session)}
+                        disabled={!session.video_available}
+                        className="bg-indigo-700 hover:bg-indigo-600 disabled:opacity-40 px-2 py-1 rounded"
+                      >
+                        Share Video
+                      </button>
+                      <button
+                        onClick={() => window.open(getSessionVideoUrl(session), '_blank')}
+                        disabled={!session.video_available}
+                        className="bg-slate-800 hover:bg-slate-700 disabled:opacity-40 px-2 py-1 rounded"
+                      >
+                        Download
+                      </button>
+                    </div>
+                  </td>
+                  <td className="p-2">
+                    <div className="flex flex-wrap gap-1">
+                      <button
+                        onClick={() => selectSessionDetails(session.id)}
+                        className="bg-amber-700 hover:bg-amber-600 px-2 py-1 rounded"
+                      >
+                        Details
+                      </button>
                     <button
                       onClick={() => generateChallan(session.id, rowSelectedProducts[session.id] || '')}
                       className="bg-cyan-700 hover:bg-cyan-600 px-2 py-1 rounded"
                     >
                       Generate
                     </button>
+                    </div>
                   </td>
                 </tr>
               ))
             ) : (
               <tr>
-                <td colSpan={9} className="p-4 text-slate-500">
+                <td colSpan={10} className="p-4 text-slate-500">
                   No sessions match the selected filters.
                 </td>
               </tr>
             )}
           </tbody>
         </table>
+      </div>
+
+      <div className="mt-4 rounded-lg border border-slate-800 bg-slate-950/60 p-4">
+        <h3 className="text-sm uppercase tracking-wide text-slate-300 mb-3">Session Details</h3>
+        {detailsLoading ? <p className="text-sm text-slate-400">Loading session details...</p> : null}
+        {detailsError ? <p className="text-sm text-red-300">{detailsError}</p> : null}
+        {!detailsLoading && !selectedSessionDetails ? (
+          <p className="text-sm text-slate-500">Select a session to preview video, products, and challans.</p>
+        ) : null}
+        {!detailsLoading && selectedSessionDetails ? (
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+              <div className="rounded border border-slate-800 bg-slate-900 p-3">
+                <p className="text-sm text-slate-200 mb-2">
+                  Session #{selectedSessionDetails?.session?.id} | Operator:{' '}
+                  {selectedSessionDetails?.session?.operator_id || '-'} | Batch:{' '}
+                  {selectedSessionDetails?.session?.batch_id || '-'}
+                </p>
+                {selectedSessionDetails?.video_url ? (
+                  <video
+                    key={selectedSessionDetails.video_url}
+                    src={selectedSessionDetails.video_url}
+                    controls
+                    className="w-full rounded border border-slate-700 bg-black"
+                  />
+                ) : (
+                  <p className="text-sm text-slate-500">Video not available</p>
+                )}
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <button
+                    onClick={() =>
+                      shareVideo({
+                        id: selectedSessionDetails?.session?.id,
+                        video_url: selectedSessionDetails?.video_url,
+                        video_share_url: selectedSessionDetails?.video_share_url
+                      })
+                    }
+                    disabled={!selectedSessionDetails?.video_url}
+                    className="bg-indigo-700 hover:bg-indigo-600 disabled:opacity-40 px-3 py-1.5 rounded text-sm"
+                  >
+                    Share Video
+                  </button>
+                  <button
+                    onClick={() => window.open(selectedSessionDetails.video_url, '_blank')}
+                    disabled={!selectedSessionDetails?.video_url}
+                    className="bg-slate-700 hover:bg-slate-600 disabled:opacity-40 px-3 py-1.5 rounded text-sm"
+                  >
+                    View Video
+                  </button>
+                </div>
+              </div>
+              <div className="rounded border border-slate-800 bg-slate-900 p-3">
+                <h4 className="text-sm font-semibold text-cyan-300 mb-2">Product Breakdown</h4>
+                <div className="max-h-64 overflow-auto">
+                  <table className="w-full text-sm">
+                    <thead className="text-slate-300">
+                      <tr>
+                        <th className="text-left p-1">Product</th>
+                        <th className="text-left p-1">Count</th>
+                        <th className="text-left p-1">First Seen</th>
+                        <th className="text-left p-1">Last Seen</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(selectedSessionDetails.products || []).length ? (
+                        selectedSessionDetails.products.map((row) => (
+                          <tr key={`${row.product_name}-${row.product_id || 'na'}`} className="border-t border-slate-800">
+                            <td className="p-1">{row.product_name}</td>
+                            <td className="p-1">{row.count}</td>
+                            <td className="p-1 text-xs text-slate-400">{formatDateTime(row.first_seen_at)}</td>
+                            <td className="p-1 text-xs text-slate-400">{formatDateTime(row.last_seen_at)}</td>
+                          </tr>
+                        ))
+                      ) : (
+                        <tr>
+                          <td className="p-2 text-slate-500" colSpan={4}>
+                            No product entries.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+                <h4 className="text-sm font-semibold text-cyan-300 mt-4 mb-2">Previous Challans</h4>
+                <div className="space-y-1">
+                  {(selectedSessionDetails.challans || []).length ? (
+                    selectedSessionDetails.challans.map((item) => (
+                      <div key={item.file_name} className="flex items-center justify-between rounded bg-slate-950 px-2 py-1">
+                        <span className="text-xs text-slate-300">{item.file_name}</span>
+                        <button
+                          onClick={() => window.open(item.url, '_blank')}
+                          className="bg-cyan-700 hover:bg-cyan-600 px-2 py-1 rounded text-xs"
+                        >
+                          Open
+                        </button>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="text-xs text-slate-500">No challans generated yet.</p>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : null}
       </div>
     </section>
   )
@@ -629,8 +959,31 @@ function App() {
                 Configure detection profile parameters before starting a new session.
               </p>
               <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                <Select
+                  label="Script / Processing Mode"
+                  value={processingMode}
+                  onChange={setProcessingMode}
+                  options={processingOptions}
+                />
+                <label className="block">
+                  <span className="text-xs text-slate-400 uppercase tracking-wide">Detected Model Files</span>
+                  <select
+                    value={modelOptions.some((option) => option.value === modelPath) ? modelPath : ''}
+                    onChange={(e) => {
+                      if (e.target.value) setModelPath(e.target.value)
+                    }}
+                    className="mt-1 w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm"
+                  >
+                    <option value="">Custom path (type below)</option>
+                    {modelOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
                 <Input label="Model Path" value={modelPath} onChange={setModelPath} />
-                <Input label="YOLOv5 Repo" value={yolov5RepoPath} onChange={setYolov5RepoPath} />
+                <Input label="YOLOv5 Repo (optional)" value={yolov5RepoPath} onChange={setYolov5RepoPath} />
                 <Input label="Conf Threshold" value={confThreshold} onChange={setConfThreshold} />
                 <Input label="IOU Threshold" value={iouThreshold} onChange={setIouThreshold} />
                 <Input label="ROI Padding" value={roiPadding} onChange={setRoiPadding} />
@@ -640,6 +993,32 @@ function App() {
             </section>
           )}
         </div>
+
+        {previewSession ? (
+          <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4">
+            <div className="w-full max-w-4xl rounded-xl border border-slate-700 bg-slate-950 p-4">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-lg font-semibold text-cyan-300">Session #{previewSession.id} Video Preview</h3>
+                <button
+                  onClick={() => setPreviewSession(null)}
+                  className="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded text-sm"
+                >
+                  Close
+                </button>
+              </div>
+              {previewSession.video_url ? (
+                <video
+                  key={previewSession.video_url}
+                  src={previewSession.video_url}
+                  controls
+                  className="w-full rounded border border-slate-700 bg-black"
+                />
+              ) : (
+                <p className="text-sm text-slate-500">Video not available</p>
+              )}
+            </div>
+          </div>
+        ) : null}
       </main>
     </div>
   )
@@ -667,6 +1046,25 @@ function Input({ label, value, onChange }) {
   )
 }
 
+function Select({ label, value, onChange, options }) {
+  return (
+    <label className="block">
+      <span className="text-xs text-slate-400 uppercase tracking-wide">{label}</span>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="mt-1 w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm"
+      >
+        {options.map(option => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  )
+}
+
 function SessionControl(props) {
   const {
     operatorId,
@@ -677,6 +1075,10 @@ function SessionControl(props) {
     setVideoSource,
     modelPath,
     setModelPath,
+    processingMode,
+    setProcessingMode,
+    processingOptions,
+    modelOptions,
     countMode,
     setCountMode,
     yolov5RepoPath,
@@ -709,12 +1111,35 @@ function SessionControl(props) {
       <div className="space-y-3">
         <Input label="Operator ID" value={operatorId} onChange={setOperatorId} />
         <Input label="Batch ID" value={batchId} onChange={setBatchId} />
-        <Input label="Video Source" value={videoSource} onChange={setVideoSource} />
+        <Input label="Video Source (Press 0 for Camera Livestream)" value={videoSource} onChange={setVideoSource} />
         <Input label="Products (comma separated)" value={productsInput} onChange={setProductsInput} />
       </div>
 
       <div className="space-y-3">
+        <label className="block">
+          <span className="text-xs text-slate-400 uppercase tracking-wide">Detected Model Files</span>
+          <select
+            value={modelOptions.some((option) => option.value === modelPath) ? modelPath : ''}
+            onChange={(e) => {
+              if (e.target.value) setModelPath(e.target.value)
+            }}
+            className="mt-1 w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm"
+          >
+            <option value="">Custom path (type below)</option>
+            {modelOptions.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
         <Input label="Model Path" value={modelPath} onChange={setModelPath} />
+        <Select
+          label="Script / Processing Mode"
+          value={processingMode}
+          onChange={setProcessingMode}
+          options={processingOptions}
+        />
         <label className="block">
           <span className="text-xs text-slate-400 uppercase tracking-wide">Count Mode</span>
           <select
@@ -728,7 +1153,7 @@ function SessionControl(props) {
         </label>
         {countMode === 'roi_current' ? (
           <>
-            <Input label="YOLOv5 Repo Path" value={yolov5RepoPath} onChange={setYolov5RepoPath} />
+            <Input label="YOLOv5 Repo Path (optional)" value={yolov5RepoPath} onChange={setYolov5RepoPath} />
             <div className="grid grid-cols-3 gap-2">
               <Input label="Conf" value={confThreshold} onChange={setConfThreshold} />
               <Input label="IOU" value={iouThreshold} onChange={setIouThreshold} />

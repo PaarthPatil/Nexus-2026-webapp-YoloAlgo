@@ -3,12 +3,15 @@ import base64
 import json
 import logging
 import os
+import socket
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
@@ -29,6 +32,8 @@ if __package__:
         get_session_products,
         get_sessions,
         get_sessions_detailed,
+        get_video_by_id,
+        get_videos_for_session,
         init_db,
         save_session,
         save_session_products,
@@ -46,6 +51,8 @@ else:
         get_session_products,
         get_sessions,
         get_sessions_detailed,
+        get_video_by_id,
+        get_videos_for_session,
         init_db,
         save_session,
         save_session_products,
@@ -76,6 +83,10 @@ app.add_middleware(
 )
 
 vision = VisionProcessor()
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MODEL_SUFFIXES = {".pt", ".pth", ".onnx", ".engine", ".tflite"}
+VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+PUBLIC_BASE_URL = os.getenv("NEXUSTRACE_PUBLIC_BASE_URL", "").strip().rstrip("/")
 
 
 def _is_missing_video_source(video_source):
@@ -125,6 +136,130 @@ def _session_tuple_to_dict(session):
     }
 
 
+def _discover_runner_scripts():
+    scripts = []
+    for script_path in sorted(PROJECT_ROOT.glob("run_yolo*.py")):
+        mode = VisionProcessor.normalize_processing_mode(script_path.name)
+        if mode not in VisionProcessor.SUPPORTED_PROCESSING_MODES:
+            continue
+        scripts.append(
+            {
+                "script_name": script_path.name,
+                "mode": mode,
+                "label": VisionProcessor.MODE_LABELS.get(mode, mode),
+                "path": str(script_path.resolve()),
+            }
+        )
+    return scripts
+
+
+def _discover_model_files():
+    seen = set()
+    models = []
+    for search_dir in [PROJECT_ROOT, PROJECT_ROOT / "nexustrace" / "backend"]:
+        if not search_dir.exists():
+            continue
+        for path in sorted(search_dir.iterdir()):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in MODEL_SUFFIXES:
+                continue
+            resolved = str(path.resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            models.append({"name": path.name, "path": resolved})
+    return models
+
+
+def _server_base_url(request: Request):
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    return str(request.base_url).rstrip("/")
+
+
+def _local_network_base_url(request: Request):
+    hostname = (request.url.hostname or "").lower()
+    if hostname not in {"127.0.0.1", "localhost"}:
+        return _server_base_url(request)
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(0.2)
+        sock.connect(("8.8.8.8", 80))
+        ip_address = sock.getsockname()[0]
+        sock.close()
+    except Exception:
+        return _server_base_url(request)
+
+    scheme = request.url.scheme or "http"
+    port = request.url.port
+    if port:
+        return f"{scheme}://{ip_address}:{port}"
+    return f"{scheme}://{ip_address}"
+
+
+def _build_video_links(request: Request, session_id: int, video_id=None):
+    base = _server_base_url(request)
+    lan_base = _local_network_base_url(request)
+    payload = {
+        "session_video_url": f"{base}/api/video/{session_id}",
+        "session_video_lan_url": f"{lan_base}/api/video/{session_id}",
+    }
+    if video_id is not None:
+        payload["video_url"] = f"{base}/api/videos/{video_id}"
+        payload["video_lan_url"] = f"{lan_base}/api/videos/{video_id}"
+    return payload
+
+
+def _resolve_video_file_path(file_path):
+    raw = str(file_path or "").strip()
+    if not raw:
+        return None
+
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+    else:
+        resolved = (PROJECT_ROOT / candidate).resolve()
+
+    if resolved.suffix.lower() not in VIDEO_SUFFIXES:
+        raise HTTPException(status_code=404, detail="Video not available")
+    if not resolved.exists() or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="Video not available")
+    return resolved
+
+
+def _list_challan_files_for_session(session_id: int):
+    files = []
+    for challan_path in CHALLANS_DIR.glob(f"challan_{session_id}*.pdf"):
+        created_iso = None
+        try:
+            created_iso = datetime.utcfromtimestamp(challan_path.stat().st_mtime).isoformat()
+        except Exception:
+            created_iso = None
+        files.append(
+            {
+                "file_name": challan_path.name,
+                "path": str(challan_path.resolve()),
+                "created_at": created_iso,
+            }
+        )
+    files.sort(key=lambda item: item["created_at"] or "", reverse=True)
+    return files
+
+
+def _video_reference_for_pdf(request: Request, session_id: int, video_id, video_path):
+    try:
+        resolved = _resolve_video_file_path(video_path)
+    except HTTPException:
+        return None, None
+    if resolved is None:
+        return None, None
+    links = _build_video_links(request, session_id, video_id)
+    return links.get("video_url") or links["session_video_url"], resolved.name
+
+
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok"}
@@ -141,6 +276,41 @@ async def current_session():
     metadata = vision.get_session_metadata()
     runtime = vision.get_runtime_metrics()
     return {"session": {**metadata, **runtime}}
+
+
+@app.get("/api/sessions/options")
+async def session_options():
+    return {
+        "processing_modes": VisionProcessor.processing_mode_catalog(),
+        "runner_scripts": _discover_runner_scripts(),
+        "model_files": _discover_model_files(),
+        "default_model_path": str(vision.default_model_path.resolve()),
+    }
+
+
+@app.get("/api/video/{session_id}")
+async def get_session_video(session_id: int):
+    session = get_session(session_id, is_admin=True)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    video_row = get_latest_video_for_session(session_id)
+    file_path = video_row["file_path"] if video_row else (session[5] if len(session) > 5 else None)
+    resolved = _resolve_video_file_path(file_path)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="Video not available")
+    return FileResponse(str(resolved), media_type="video/mp4", filename=resolved.name)
+
+
+@app.get("/api/videos/{video_id}")
+async def get_video_by_identifier(video_id: int):
+    row = get_video_by_id(video_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Video not found")
+    resolved = _resolve_video_file_path(row.get("file_path"))
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="Video not available")
+    return FileResponse(str(resolved), media_type="video/mp4", filename=resolved.name)
 
 
 @app.post("/api/sessions/products")
@@ -160,6 +330,7 @@ async def start_session(data: dict):
     batch_id = data.get("batch_id")
     video_source = data.get("video_source")
     model_path = data.get("model_path")
+    processing_mode = data.get("processing_mode", "yolo3")  # Default to yolo3
     count_mode = data.get("count_mode")
     yolov5_repo_path = data.get("yolov5_repo_path")
     conf_threshold = data.get("conf_threshold")
@@ -183,6 +354,7 @@ async def start_session(data: dict):
             operator_id,
             batch_id,
             model_path=model_path,
+            processing_mode=processing_mode,
             count_mode=count_mode,
             yolov5_repo_path=yolov5_repo_path,
             conf_threshold=conf_threshold,
@@ -202,6 +374,7 @@ async def start_session(data: dict):
     return {
         "message": "Session started",
         "model_path": vision.model_path,
+        "processing_mode": vision.processing_mode,
         "count_mode": vision.count_mode,
         "yolov5_repo_path": vision.yolov5_repo_path,
         "products": vision.session_products,
@@ -210,7 +383,7 @@ async def start_session(data: dict):
 
 
 @app.post("/api/sessions/stop")
-async def stop_session(data: dict):
+async def stop_session(data: dict, request: Request):
     metadata = vision.get_session_metadata()
     if not vision.video_path:
         raise HTTPException(status_code=400, detail="No session is available to stop.")
@@ -236,7 +409,7 @@ async def stop_session(data: dict):
     finalized_video_path, video_codec = vision.finalize_session_video(session_id)
     if finalized_video_path:
         update_session_video_path(session_id, finalized_video_path)
-    save_video_metadata(session_id, finalized_video_path or video_path, codec=video_codec)
+    video_id = save_video_metadata(session_id, finalized_video_path or video_path, codec=video_codec)
 
     product_counts = vision.final_product_counts or {}
     if not product_counts and metadata.get("products"):
@@ -246,6 +419,11 @@ async def stop_session(data: dict):
     session = get_session(session_id, is_admin=True)
     session_dict = _session_tuple_to_dict(session)
     product_rows = get_session_products(session_id)
+    video_links = _build_video_links(request, session_id, video_id)
+    resolved_video_path = finalized_video_path or session_dict["video_path"]
+    video_reference_url, video_file_name = _video_reference_for_pdf(
+        request, session_id, video_id, resolved_video_path
+    )
     try:
         challan_path = generate_challan(
             session_id=session_id,
@@ -254,7 +432,9 @@ async def stop_session(data: dict):
             timestamp=session_dict["timestamp"],
             final_count=session_dict["final_count"],
             product_rows=product_rows,
-            video_path=finalized_video_path or session_dict["video_path"],
+            video_path=resolved_video_path,
+            video_file_name=video_file_name,
+            video_reference_url=video_reference_url,
             selected_products=selected_products or None,
         )
     except ValueError as e:
@@ -274,6 +454,9 @@ async def stop_session(data: dict):
         "final_count": count,
         "count_method": "final_check_median_recent_frames",
         "video_path": finalized_video_path or video_path,
+        "video_id": video_id,
+        "video_url": video_links.get("video_url") or video_links["session_video_url"],
+        "video_share_url": video_links.get("video_lan_url") or video_links["session_video_lan_url"],
         "challan_path": challan_path,
         "challan_file": Path(challan_path).name,
         "product_counts": product_counts,
@@ -288,6 +471,7 @@ async def get_history():
 
 @app.get("/api/sessions/history/detailed")
 async def get_history_detailed(
+    request: Request,
     search: str = Query(default="", description="Search by session id, operator, or batch"),
     operator_id: str = Query(default="", description="Filter by operator"),
     product_name: str = Query(default="", description="Filter by product"),
@@ -302,6 +486,17 @@ async def get_history_detailed(
         date_to=date_to or None,
         search=search or None,
     )
+    for item in sessions:
+        links = _build_video_links(request, item["id"], item.get("resolved_video_id"))
+        try:
+            _resolve_video_file_path(item.get("resolved_video_path"))
+            item["video_url"] = links.get("video_url") or links["session_video_url"]
+            item["video_share_url"] = links.get("video_lan_url") or links["session_video_lan_url"]
+            item["video_available"] = True
+        except HTTPException:
+            item["video_url"] = None
+            item["video_share_url"] = None
+            item["video_available"] = False
     return {"sessions": sessions}
 
 
@@ -310,8 +505,81 @@ async def get_history_filter_values():
     return get_history_filters()
 
 
+@app.get("/api/sessions/{session_id}/challans")
+async def list_session_challans(session_id: int, request: Request):
+    session = get_session(session_id, is_admin=True)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    base = _server_base_url(request)
+    challans = []
+    for item in _list_challan_files_for_session(session_id):
+        challans.append(
+            {
+                "file_name": item["file_name"],
+                "url": f"{base}/api/challans/files/{quote(item['file_name'])}",
+                "created_at": item["created_at"],
+            }
+        )
+    return {"session_id": session_id, "challans": challans}
+
+
+@app.get("/api/sessions/{session_id}/details")
+async def get_session_details(session_id: int, request: Request):
+    session = get_session(session_id, is_admin=True)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session_dict = _session_tuple_to_dict(session)
+    products = get_session_products(session_id)
+    videos = get_videos_for_session(session_id)
+    latest_video = videos[0] if videos else None
+    links = _build_video_links(request, session_id, latest_video.get("id") if latest_video else None)
+
+    challans = []
+    base = _server_base_url(request)
+    for item in _list_challan_files_for_session(session_id):
+        challans.append(
+            {
+                "file_name": item["file_name"],
+                "url": f"{base}/api/challans/files/{quote(item['file_name'])}",
+                "created_at": item["created_at"],
+            }
+        )
+
+    for video in videos:
+        video_url, video_name = _video_reference_for_pdf(
+            request, session_id, video.get("id"), video.get("file_path")
+        )
+        video_links = _build_video_links(request, session_id, video.get("id"))
+        video["video_url"] = video_url
+        video["video_share_url"] = (
+            video_links.get("video_lan_url") or video_links["session_video_lan_url"]
+            if video_url
+            else None
+        )
+        video["video_file_name"] = video_name
+
+    latest_video_url, _latest_video_name = _video_reference_for_pdf(
+        request,
+        session_id,
+        latest_video.get("id") if latest_video else None,
+        latest_video.get("file_path") if latest_video else None,
+    )
+
+    return {
+        "session": session_dict,
+        "products": products,
+        "videos": videos,
+        "latest_video": latest_video,
+        "video_url": latest_video_url,
+        "video_share_url": (links.get("video_lan_url") or links["session_video_lan_url"]) if latest_video_url else None,
+        "challans": challans,
+    }
+
+
 @app.post("/api/challans/generate")
-async def generate_challan_for_session(data: dict):
+async def generate_challan_for_session(data: dict, request: Request):
     session_id = data.get("session_id")
     if session_id is None:
         raise HTTPException(status_code=400, detail="session_id is required")
@@ -330,6 +598,9 @@ async def generate_challan_for_session(data: dict):
     products = get_session_products(session_id)
     video_row = get_latest_video_for_session(session_id)
     video_path = video_row["file_path"] if video_row else session_dict.get("video_path")
+    video_reference_url, video_file_name = _video_reference_for_pdf(
+        request, session_id, video_row.get("id") if video_row else None, video_path
+    )
 
     try:
         challan_path = generate_challan(
@@ -340,6 +611,8 @@ async def generate_challan_for_session(data: dict):
             final_count=session_dict["final_count"],
             product_rows=products,
             video_path=video_path,
+            video_file_name=video_file_name,
+            video_reference_url=video_reference_url,
             selected_products=selected_products or None,
         )
     except ValueError as e:
@@ -351,6 +624,7 @@ async def generate_challan_for_session(data: dict):
         "challan_file": Path(challan_path).name,
         "session_id": session_dict["id"],
         "products": selected_products or [row["product_name"] for row in products],
+        "video_url": video_reference_url,
     }
 
 
@@ -364,7 +638,7 @@ async def get_challan_file(file_name: str):
 
 
 @app.get("/api/challans/{session_id}")
-async def get_challan(session_id: int):
+async def get_challan(session_id: int, request: Request):
     session = get_session(session_id, is_admin=True)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -373,6 +647,11 @@ async def get_challan(session_id: int):
     if not challan_path.exists():
         product_rows = get_session_products(session_id)
         video_row = get_latest_video_for_session(session_id)
+        video_path = video_row["file_path"] if video_row else session_dict["video_path"]
+        video_links = _build_video_links(request, session_id, video_row.get("id") if video_row else None)
+        video_reference_url, video_file_name = _video_reference_for_pdf(
+            request, session_id, video_row.get("id") if video_row else None, video_path
+        )
         try:
             generated = generate_challan(
                 session_id=session_id,
@@ -381,7 +660,9 @@ async def get_challan(session_id: int):
                 timestamp=session_dict["timestamp"],
                 final_count=session_dict["final_count"],
                 product_rows=product_rows,
-                video_path=video_row["file_path"] if video_row else session_dict["video_path"],
+                video_path=video_path,
+                video_file_name=video_file_name,
+                video_reference_url=video_reference_url,
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))

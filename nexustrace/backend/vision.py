@@ -5,11 +5,12 @@ import shutil
 import statistics
 import subprocess
 import time
-from collections import deque
+from collections import deque, OrderedDict
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import cv2
+import numpy as np
 import torch
 
 if __package__:
@@ -23,13 +24,116 @@ os.environ.setdefault("ULTRALYTICS_CONFIG_DIR", str(ULTRALYTICS_SETTINGS_DIR))
 from ultralytics import YOLO
 
 
+class HysteresisTracker:
+    def __init__(self, maxDisappeared=20, maxDistance=60):
+        self.nextObjectID = 1
+        self.objects = OrderedDict()
+        self.disappeared = OrderedDict()
+        self.maxDisappeared = maxDisappeared
+        self.maxDistance = maxDistance
+
+    def register(self, centroid):
+        self.objects[self.nextObjectID] = centroid
+        self.disappeared[self.nextObjectID] = 0
+        self.nextObjectID += 1
+
+    def deregister(self, objectID):
+        del self.objects[objectID]
+        del self.disappeared[objectID]
+
+    def update(self, rects, confidences, init_threshold=0.60):
+        if len(rects) == 0:
+            for objectID in list(self.disappeared.keys()):
+                self.disappeared[objectID] += 1
+                if self.disappeared[objectID] > self.maxDisappeared:
+                    self.deregister(objectID)
+            return self.objects
+
+        inputCentroids = np.zeros((len(rects), 2), dtype="int")
+        for (i, (startX, startY, endX, endY)) in enumerate(rects):
+            cX = int((startX + endX) / 2.0)
+            cY = int((startY + endY) / 2.0)
+            inputCentroids[i] = (cX, cY)
+
+        if len(self.objects) == 0:
+            for i in range(0, len(inputCentroids)):
+                if confidences[i] >= init_threshold:
+                    self.register(inputCentroids[i])
+        else:
+            objectIDs = list(self.objects.keys())
+            objectCentroids = list(self.objects.values())
+
+            D = np.linalg.norm(np.array(objectCentroids)[:, np.newaxis] - inputCentroids, axis=2)
+
+            rows = D.min(axis=1).argsort()
+            cols = D.argmin(axis=1)[rows]
+
+            usedRows = set()
+            usedCols = set()
+
+            for (row, col) in zip(rows, cols):
+                if row in usedRows or col in usedCols:
+                    continue
+
+                if D[row, col] > self.maxDistance:
+                    continue
+
+                objectID = objectIDs[row]
+                self.objects[objectID] = inputCentroids[col]
+                self.disappeared[objectID] = 0
+
+                usedRows.add(row)
+                usedCols.add(col)
+
+            unusedRows = set(range(0, D.shape[0])).difference(usedRows)
+            unusedCols = set(range(0, D.shape[1])).difference(usedCols)
+
+            for row in unusedRows:
+                objectID = objectIDs[row]
+                self.disappeared[objectID] += 1
+                if self.disappeared[objectID] > self.maxDisappeared:
+                    self.deregister(objectID)
+
+            for col in unusedCols:
+                if confidences[col] >= init_threshold:
+                    self.register(inputCentroids[col])
+
+        return self.objects
+
+
 class VisionProcessor:
+    MODE_LABELS = {
+        "yolo2": "YOLOv2 Style (run_yolo2.py)",
+        "yolo3": "YOLOv3 Optimized (run_yolo3.py)",
+        "yolo4": "YOLOv4 Optimized (run_yolo4.py)",
+        "yolo5": "YOLOv5 Hysteresis (run_yolo5.py)",
+        "yolorasppi": "YOLO Raspberry Pi (run_yoloraspPi.py)",
+    }
+    MODE_ALIASES = {
+        "run_yolo.py": "yolo2",
+        "run_yolo2.py": "yolo2",
+        "yolo2": "yolo2",
+        "yolo3": "yolo3",
+        "run_yolo3.py": "yolo3",
+        "yolo4": "yolo4",
+        "run_yolo4.py": "yolo4",
+        "yolo5": "yolo5",
+        "run_yolo5.py": "yolo5",
+        "yolorasppi": "yolorasppi",
+        "yolorasp_pi": "yolorasppi",
+        "yolo_raspi": "yolorasppi",
+        "yolorasp-pi": "yolorasppi",
+        "run_yolorasppi.py": "yolorasppi",
+    }
+    SUPPORTED_PROCESSING_MODES = set(MODE_LABELS.keys())
+
     def __init__(self, default_model_path=None, debug=True):
         self.default_model_path = Path(default_model_path) if default_model_path else DEFAULT_MODEL_PATH
         self.debug = debug
 
         self.model_path = None
         self.model = None
+        self.processing_mode = "yolo3"
         self.count_mode = "track_unique"
         self.conf_threshold = 0.50
         self.iou_threshold = 0.65
@@ -51,6 +155,9 @@ class VisionProcessor:
         self.session_products = []
         self.session_products_lookup = set()
 
+        # Hysteresis tracker for yolo5 and yolorasppi modes
+        self.tracker = HysteresisTracker()
+
         self.count = 0
         self.cap = None
         self.out = None
@@ -68,6 +175,21 @@ class VisionProcessor:
         self.fps_value = 0.0
         self.latest_confidence = 0.0
         self.output_codec = "mp4v"
+
+    @classmethod
+    def normalize_processing_mode(cls, processing_mode):
+        value = str(processing_mode or "yolo3").strip().lower()
+        if not value:
+            return "yolo3"
+        return cls.MODE_ALIASES.get(value, value)
+
+    @classmethod
+    def processing_mode_catalog(cls):
+        options = []
+        for value, label in cls.MODE_LABELS.items():
+            aliases = sorted([k for k, v in cls.MODE_ALIASES.items() if v == value and k != value])
+            options.append({"value": value, "label": label, "aliases": aliases})
+        return options
 
     def is_running(self):
         return self.running
@@ -191,8 +313,11 @@ class VisionProcessor:
             if raw_path.exists():
                 resolved = raw_path
             else:
+                project_root = Path(__file__).resolve().parents[2]
                 candidates = [
                     Path(__file__).resolve().parent / raw_path,
+                    Path(__file__).resolve().parents[1] / raw_path,
+                    project_root / raw_path,
                     Path("D:/Nexus") / raw_path,
                     Path("D:/Nexus/box_detection") / raw_path,
                 ]
@@ -219,14 +344,35 @@ class VisionProcessor:
 
     def _resolve_yolov5_repo_path(self, repo_path=None):
         raw = str(repo_path).strip() if repo_path is not None else ""
-        if raw and Path(raw).exists():
-            return str(Path(raw).resolve())
+        project_root = Path(__file__).resolve().parents[2]
+        backend_root = Path(__file__).resolve().parent
+        app_root = Path(__file__).resolve().parents[1]
+
+        if raw:
+            raw_path = Path(raw)
+            search_paths = [
+                raw_path,
+                project_root / raw_path,
+                app_root / raw_path,
+                backend_root / raw_path,
+            ]
+            for candidate in search_paths:
+                if candidate.exists():
+                    return str(candidate.resolve())
 
         env_repo = os.getenv("NEXUSTRACE_YOLOV5_REPO", "").strip()
-        if env_repo and Path(env_repo).exists():
-            return str(Path(env_repo).resolve())
+        if env_repo:
+            env_path = Path(env_repo)
+            if env_path.exists():
+                return str(env_path.resolve())
 
-        for candidate in [Path("D:/Nexus/yolov5"), Path(__file__).resolve().parent / "yolov5"]:
+        for candidate in [
+            project_root / "yolov5",
+            app_root / "yolov5",
+            backend_root / "yolov5",
+            Path("yolov5"),
+            Path("D:/Nexus/yolov5"),
+        ]:
             if candidate.exists():
                 return str(candidate.resolve())
 
@@ -295,6 +441,41 @@ class VisionProcessor:
             ]
             if filtered:
                 self.small_box_classes = filtered
+        if self.processing_mode == "yolo3":
+            self.model.classes = sorted(set(self.bigger_box_classes + self.small_box_classes))
+
+    def _configure_model_for_processing_mode(self):
+        if self.count_mode != "roi_current" or self.model is None:
+            return
+
+        if self.processing_mode == "yolo3":
+            self.model.agnostic = True
+            self.model.max_det = 100
+            self.model.classes = sorted(set(self.bigger_box_classes + self.small_box_classes))
+            return
+
+        if self.processing_mode == "yolo4":
+            self.model.agnostic = False
+            self.model.max_det = 100
+            self.model.classes = None
+            return
+
+        if self.processing_mode == "yolo5":
+            self.model.agnostic = False
+            self.model.max_det = 100
+            self.model.classes = None
+            return
+
+        if self.processing_mode == "yolorasppi":
+            self.model.agnostic = False
+            self.model.max_det = 50
+            self.model.classes = None
+            return
+
+        # yolo2 baseline
+        self.model.agnostic = False
+        self.model.max_det = 100
+        self.model.classes = None
 
     @staticmethod
     def _draw_text_with_background(
@@ -334,6 +515,7 @@ class VisionProcessor:
         operator_id,
         batch_id,
         model_path=None,
+        processing_mode="yolo3",
         owner_user_id=None,
         count_mode=None,
         yolov5_repo_path=None,
@@ -353,6 +535,11 @@ class VisionProcessor:
         if self.count_mode not in {"track_unique", "roi_current"}:
             raise RuntimeError("Unsupported count_mode. Allowed: track_unique, roi_current.")
 
+        self.processing_mode = self.normalize_processing_mode(processing_mode)
+        if self.processing_mode not in self.SUPPORTED_PROCESSING_MODES:
+            allowed = ", ".join(sorted(self.SUPPORTED_PROCESSING_MODES))
+            raise RuntimeError(f"Unsupported processing_mode. Allowed: {allowed}.")
+
         self.conf_threshold = float(conf_threshold) if conf_threshold is not None else 0.50
         self.iou_threshold = float(iou_threshold) if iou_threshold is not None else 0.65
         self.roi_padding = int(roi_padding) if roi_padding is not None else 5
@@ -367,6 +554,7 @@ class VisionProcessor:
         if self.count_mode == "roi_current":
             repo_path = self._resolve_yolov5_repo_path(yolov5_repo_path)
             self._load_roi_current_model(resolved_model_path, repo_path)
+            self._configure_model_for_processing_mode()
         else:
             self._load_model(resolved_model_path)
 
@@ -384,6 +572,9 @@ class VisionProcessor:
         self.session_started_at = datetime.utcnow().isoformat()
         self.session_ended_at = None
         self._reset_product_state()
+
+        # Reset tracker for new session
+        self.tracker = HysteresisTracker()
 
         parsed_source = self._parse_video_source(video_source)
         self.cap = cv2.VideoCapture(parsed_source)
@@ -517,10 +708,21 @@ class VisionProcessor:
             return
 
         started = time.time()
-        if self.count_mode == "roi_current":
-            annotated_frame, frame_count, product_counts, confidences = self._process_frame_roi_mode(frame)
-        else:
+
+        if self.count_mode == "track_unique":
             annotated_frame, frame_count, product_counts, confidences = self._process_frame_track_mode(frame)
+        elif self.processing_mode == "yolo2":
+            annotated_frame, frame_count, product_counts, confidences = self._process_frame_yolo2(frame)
+        elif self.processing_mode == "yolo3":
+            annotated_frame, frame_count, product_counts, confidences = self._process_frame_yolo3(frame)
+        elif self.processing_mode == "yolo4":
+            annotated_frame, frame_count, product_counts, confidences = self._process_frame_yolo4(frame)
+        elif self.processing_mode == "yolo5":
+            annotated_frame, frame_count, product_counts, confidences = self._process_frame_yolo5(frame)
+        elif self.processing_mode == "yolorasppi":
+            annotated_frame, frame_count, product_counts, confidences = self._process_frame_yolorasppi(frame)
+        else:
+            annotated_frame, frame_count, product_counts, confidences = self._process_frame_yolo2(frame)
 
         self._record_frame_count(frame_count)
         self._record_product_frame_counts(product_counts)
@@ -721,6 +923,281 @@ class VisionProcessor:
         self.video_path = str(target)
         self.cleanup_old_videos(max_age_days=30)
         return self.video_path, codec
+
+    def _process_frame_yolo2(self, frame):
+        """YOLOv2-style baseline processing from run_yolo.py/run_yolo2.py."""
+        results = self.model(frame)
+        detections = results.xyxy[0].cpu().numpy() if hasattr(results, "xyxy") else []
+
+        roi_box = None
+        for det in detections:
+            cls_id = int(det[5])
+            if cls_id in self.bigger_box_classes:
+                roi_box = (det[0], det[1], det[2], det[3])
+                break
+
+        if roi_box:
+            rx1, ry1, rx2, ry2 = map(int, roi_box)
+            cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (255, 0, 0), 2)
+            self._draw_text_with_background(
+                frame, "ROI Boundary", (rx1, max(20, ry1 - 5)), text_color=(255, 255, 255), bg_color=(255, 0, 0)
+            )
+
+        per_product_counts = {}
+        confidences = []
+        count = 0
+
+        for det in detections:
+            cls_id = int(det[5])
+            confidence = float(det[4])
+            confidences.append(confidence)
+            if cls_id not in self.small_box_classes:
+                continue
+
+            bx1, by1, bx2, by2 = det[0], det[1], det[2], det[3]
+            cx, cy = (bx1 + bx2) / 2, (by1 + by2) / 2
+            if roi_box is None:
+                continue
+
+            rx1, ry1, rx2, ry2 = roi_box
+            padding = self.roi_padding
+            if (rx1 - padding) < cx < (rx2 + padding) and (ry1 - padding) < cy < (ry2 + padding):
+                count += 1
+                cv2.rectangle(frame, (int(bx1), int(by1)), (int(bx2), int(by2)), (0, 255, 0), 2)
+                cv2.circle(frame, (int(cx), int(cy)), 3, (0, 255, 0), -1)
+
+                label = self._class_name_from_id(cls_id)
+                if self._should_track_product(label):
+                    per_product_counts[label] = per_product_counts.get(label, 0) + 1
+
+        self.count = count
+        return frame, count, per_product_counts, confidences
+
+    def _process_frame_yolo3(self, frame):
+        """YOLOv3-style processing from run_yolo3.py - ROI-based counting with optimizations"""
+        results = self.model(frame)
+        detections = results.xyxy[0].cpu().numpy() if hasattr(results, "xyxy") else []
+
+        # Find ROI (bigger box)
+        roi_box = None
+        for det in detections:
+            cls_id = int(det[5])
+            if cls_id in self.bigger_box_classes:
+                roi_box = (det[0], det[1], det[2], det[3])
+                break
+
+        # Draw ROI boundary
+        if roi_box:
+            rx1, ry1, rx2, ry2 = map(int, roi_box)
+            cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (255, 0, 0), 2)
+            self._draw_text_with_background(
+                frame, "ROI Boundary", (rx1, max(20, ry1 - 5)), text_color=(255, 255, 255), bg_color=(255, 0, 0)
+            )
+
+        per_product_counts = {}
+        confidences = []
+        small_boxes_inside_roi = 0
+
+        for det in detections:
+            cls_id = int(det[5])
+            confidence = float(det[4])
+            confidences.append(confidence)
+
+            if cls_id in self.small_box_classes:
+                bx1, by1, bx2, by2 = det[0], det[1], det[2], det[3]
+                cx, cy = (bx1 + bx2) / 2, (by1 + by2) / 2
+
+                if roi_box:
+                    rx1, ry1, rx2, ry2 = roi_box
+                    padding = self.roi_padding
+                    if (rx1 - padding) < cx < (rx2 + padding) and (ry1 - padding) < cy < (ry2 + padding):
+                        small_boxes_inside_roi += 1
+                        cv2.rectangle(frame, (int(bx1), int(by1)), (int(bx2), int(by2)), (0, 255, 0), 2)
+                        cv2.circle(frame, (int(cx), int(cy)), 3, (0, 255, 0), -1)
+
+                        # Count per product type
+                        label = self._class_name_from_id(cls_id)
+                        if self._should_track_product(label):
+                            per_product_counts[label] = per_product_counts.get(label, 0) + 1
+
+        self.count = small_boxes_inside_roi
+        return frame, small_boxes_inside_roi, per_product_counts, confidences
+
+    def _process_frame_yolo4(self, frame):
+        """YOLOv4-style processing - similar to yolo3 but with different model settings"""
+        # Configure model for yolo4 style (agnostic=False, no class filtering)
+        self.model.agnostic = False
+        self.model.max_det = 100
+
+        results = self.model(frame)
+        detections = results.xyxy[0].cpu().numpy() if hasattr(results, "xyxy") else []
+
+        # Find ROI
+        roi_box = None
+        for det in detections:
+            cls_id = int(det[5])
+            if cls_id in self.bigger_box_classes:
+                roi_box = (det[0], det[1], det[2], det[3])
+                break
+
+        if roi_box:
+            rx1, ry1, rx2, ry2 = map(int, roi_box)
+            cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (255, 0, 0), 2)
+            self._draw_text_with_background(
+                frame, "ROI Boundary", (rx1, max(20, ry1 - 5)), text_color=(255, 255, 255), bg_color=(255, 0, 0)
+            )
+
+        per_product_counts = {}
+        confidences = []
+        count = 0
+
+        for det in detections:
+            cls_id = int(det[5])
+            confidence = float(det[4])
+            confidences.append(confidence)
+
+            if cls_id in self.small_box_classes:
+                bx1, by1, bx2, by2 = det[0], det[1], det[2], det[3]
+                cx, cy = (bx1 + bx2) / 2, (by1 + by2) / 2
+
+                if roi_box:
+                    rx1, ry1, rx2, ry2 = roi_box
+                    padding = self.roi_padding
+                    if (rx1 - padding) < cx < (rx2 + padding) and (ry1 - padding) < cy < (ry2 + padding):
+                        count += 1
+                        cv2.rectangle(frame, (int(bx1), int(by1)), (int(bx2), int(by2)), (0, 255, 0), 2)
+                        cv2.circle(frame, (int(cx), int(cy)), 3, (0, 255, 0), -1)
+
+                        label = self._class_name_from_id(cls_id)
+                        if self._should_track_product(label):
+                            per_product_counts[label] = per_product_counts.get(label, 0) + 1
+
+        self.count = count
+        return frame, count, per_product_counts, confidences
+
+    def _process_frame_yolo5(self, frame):
+        """YOLOv5-style processing with HysteresisTracker from run_yolo5.py"""
+        results = self.model(frame)
+        detections = results.xyxy[0].cpu().numpy() if hasattr(results, "xyxy") else []
+
+        # Find ROI (bigger box)
+        roi_box = None
+        for det in detections:
+            cls_id = int(det[5])
+            if cls_id in self.bigger_box_classes:
+                roi_box = (det[0], det[1], det[2], det[3])
+                break
+
+        # Draw ROI boundary
+        if roi_box:
+            rx1, ry1, rx2, ry2 = map(int, roi_box)
+            cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (255, 0, 0), 2)
+            self._draw_text_with_background(
+                frame, "ROI Boundary", (rx1, max(20, ry1 - 5)), text_color=(255, 255, 255), bg_color=(255, 0, 0)
+            )
+
+        # Filter detections to small boxes within ROI
+        valid_rects = []
+        valid_confidences = []
+        per_product_counts = {}
+        confidences = []
+
+        for det in detections:
+            cls_id = int(det[5])
+            confidence = float(det[4])
+            confidences.append(confidence)
+
+            if cls_id in self.small_box_classes:
+                bx1, by1, bx2, by2 = det[0], det[1], det[2], det[3]
+                cx, cy = (bx1 + bx2) / 2, (by1 + by2) / 2
+
+                if roi_box:
+                    rx1, ry1, rx2, ry2 = roi_box
+                    padding = self.roi_padding
+                    if (rx1 - padding) < cx < (rx2 + padding) and (ry1 - padding) < cy < (ry2 + padding):
+                        valid_rects.append((bx1, by1, bx2, by2))
+                        valid_confidences.append(confidence)
+
+                        # Count per product type
+                        label = self._class_name_from_id(cls_id)
+                        if self._should_track_product(label):
+                            per_product_counts[label] = per_product_counts.get(label, 0) + 1
+
+        # Update tracker with valid detections
+        objects = self.tracker.update(valid_rects, valid_confidences, init_threshold=0.60)
+
+        # Draw tracked objects
+        for (objectID, centroid) in objects.items():
+            text = f"ID {objectID}"
+            cv2.putText(frame, text, (centroid[0] - 10, centroid[1] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.circle(frame, (centroid[0], centroid[1]), 4, (0, 255, 0), -1)
+
+        tracked_count = len(objects)
+        self.count = tracked_count
+        return frame, tracked_count, per_product_counts, confidences
+
+    def _process_frame_yolorasppi(self, frame):
+        """YOLO Raspberry Pi style processing with HysteresisTracker from run_yoloraspPi.py"""
+        results = self.model(frame)
+        detections = results.xyxy[0].cpu().numpy() if hasattr(results, "xyxy") else []
+
+        # Find ROI (bigger box)
+        roi_box = None
+        for det in detections:
+            cls_id = int(det[5])
+            if cls_id in self.bigger_box_classes:
+                roi_box = (det[0], det[1], det[2], det[3])
+                break
+
+        # Draw ROI boundary
+        if roi_box:
+            rx1, ry1, rx2, ry2 = map(int, roi_box)
+            cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (255, 0, 0), 2)
+            self._draw_text_with_background(
+                frame, "ROI Boundary", (rx1, max(20, ry1 - 5)), text_color=(255, 255, 255), bg_color=(255, 0, 0)
+            )
+
+        # Filter detections to small boxes within ROI
+        valid_rects = []
+        valid_confidences = []
+        per_product_counts = {}
+        confidences = []
+
+        for det in detections:
+            cls_id = int(det[5])
+            confidence = float(det[4])
+            confidences.append(confidence)
+
+            if cls_id in self.small_box_classes:
+                bx1, by1, bx2, by2 = det[0], det[1], det[2], det[3]
+                cx, cy = (bx1 + bx2) / 2, (by1 + by2) / 2
+
+                if roi_box:
+                    rx1, ry1, rx2, ry2 = roi_box
+                    padding = self.roi_padding
+                    if (rx1 - padding) < cx < (rx2 + padding) and (ry1 - padding) < cy < (ry2 + padding):
+                        valid_rects.append((bx1, by1, bx2, by2))
+                        valid_confidences.append(confidence)
+
+                        # Count per product type
+                        label = self._class_name_from_id(cls_id)
+                        if self._should_track_product(label):
+                            per_product_counts[label] = per_product_counts.get(label, 0) + 1
+
+        # Update tracker with lower init_threshold for Raspberry Pi (less powerful)
+        objects = self.tracker.update(valid_rects, valid_confidences, init_threshold=0.55)
+
+        # Draw tracked objects
+        for (objectID, centroid) in objects.items():
+            text = f"ID {objectID}"
+            cv2.putText(frame, text, (centroid[0] - 10, centroid[1] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.circle(frame, (centroid[0], centroid[1]), 4, (0, 255, 0), -1)
+
+        tracked_count = len(objects)
+        self.count = tracked_count
+        return frame, tracked_count, per_product_counts, confidences
 
     @staticmethod
     def cleanup_old_videos(max_age_days=30):
