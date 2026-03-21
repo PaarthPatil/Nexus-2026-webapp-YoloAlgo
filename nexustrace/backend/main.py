@@ -11,9 +11,9 @@ from pathlib import Path
 from urllib.parse import quote
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 if __package__:
     from .config import CHALLANS_DIR, LOGS_DIR, ULTRALYTICS_SETTINGS_DIR, ensure_app_dirs
@@ -25,6 +25,8 @@ os.environ.setdefault("ULTRALYTICS_CONFIG_DIR", str(ULTRALYTICS_SETTINGS_DIR))
 
 if __package__:
     from .database import (
+        count_users,
+        create_user,
         get_dashboard_stats,
         get_history_filters,
         get_latest_video_for_session,
@@ -32,6 +34,8 @@ if __package__:
         get_session_products,
         get_sessions,
         get_sessions_detailed,
+        get_user_by_id,
+        get_user_by_username,
         get_video_by_id,
         get_videos_for_session,
         init_db,
@@ -40,10 +44,13 @@ if __package__:
         save_video_metadata,
         update_session_video_path,
     )
+    from .auth import create_access_token, decode_access_token, hash_password, verify_password
     from .pdf_generator import generate_challan
     from .vision import VisionProcessor
 else:
     from database import (
+        count_users,
+        create_user,
         get_dashboard_stats,
         get_history_filters,
         get_latest_video_for_session,
@@ -51,6 +58,8 @@ else:
         get_session_products,
         get_sessions,
         get_sessions_detailed,
+        get_user_by_id,
+        get_user_by_username,
         get_video_by_id,
         get_videos_for_session,
         init_db,
@@ -59,15 +68,33 @@ else:
         save_video_metadata,
         update_session_video_path,
     )
+    from auth import create_access_token, decode_access_token, hash_password, verify_password
     from pdf_generator import generate_challan
     from vision import VisionProcessor
 
 logging.basicConfig(filename=str(LOGS_DIR / "nexustrace.log"), level=logging.INFO)
 
 
+def _bootstrap_admin_user():
+    existing = get_user_by_username(ADMIN_USERNAME)
+    if existing:
+        return
+
+    total_users = count_users()
+    created = create_user(
+        username=ADMIN_USERNAME,
+        password_hash=hash_password(ADMIN_PASSWORD),
+        full_name=ADMIN_FULL_NAME,
+        is_admin=True,
+    )
+    if created:
+        logging.info("Bootstrapped default admin user '%s' (existing users before bootstrap: %s)", ADMIN_USERNAME, total_users)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    _bootstrap_admin_user()
     VisionProcessor.cleanup_old_videos(max_age_days=30)
     yield
 
@@ -82,11 +109,60 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+def _extract_bearer_token(header_value):
+    raw = str(header_value or "").strip()
+    if not raw:
+        return None
+    if raw.lower().startswith("bearer "):
+        return raw.split(" ", 1)[1].strip()
+    return None
+
+
+def _current_user_from_request(request: Request):
+    token = _extract_bearer_token(request.headers.get("Authorization"))
+    if not token:
+        return None
+    payload = decode_access_token(token)
+    if not payload:
+        return None
+    user_id = payload.get("sub")
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    return get_user_by_id(user_id)
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS" or path in PUBLIC_ROUTES:
+        return await call_next(request)
+
+    user = _current_user_from_request(request)
+    if user is None:
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"detail": "Authentication required"},
+        )
+
+    request.state.user = user
+    return await call_next(request)
+
+
 vision = VisionProcessor()
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_SUFFIXES = {".pt", ".pth", ".onnx", ".engine", ".tflite"}
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 PUBLIC_BASE_URL = os.getenv("NEXUSTRACE_PUBLIC_BASE_URL", "").strip().rstrip("/")
+ADMIN_USERNAME = os.getenv("NEXUSTRACE_ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("NEXUSTRACE_ADMIN_PASSWORD", "admin123")
+ADMIN_FULL_NAME = os.getenv("NEXUSTRACE_ADMIN_FULL_NAME", "System Administrator")
+PUBLIC_ROUTES = {
+    "/api/health",
+    "/api/auth/login",
+}
 
 
 def _is_missing_video_source(video_source):
@@ -263,6 +339,45 @@ def _video_reference_for_pdf(request: Request, session_id: int, video_id, video_
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok"}
+
+
+@app.post("/api/auth/login")
+async def login(data: dict):
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username and password are required")
+
+    user = get_user_by_username(username)
+    if not user or not verify_password(password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = create_access_token(user)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "id": user["id"],
+            "username": user["username"],
+            "full_name": user.get("full_name"),
+            "is_admin": bool(user.get("is_admin")),
+        },
+    }
+
+
+@app.get("/api/auth/me")
+async def me(request: Request):
+    user = getattr(request.state, "user", None)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return {
+        "user": {
+            "id": user["id"],
+            "username": user["username"],
+            "full_name": user.get("full_name"),
+            "is_admin": bool(user.get("is_admin")),
+        }
+    }
 
 
 @app.get("/api/dashboard/stats")
@@ -675,6 +790,20 @@ async def get_challan(session_id: int, request: Request):
 
 @app.websocket("/ws/live-feed")
 async def websocket_endpoint(websocket: WebSocket):
+    token = websocket.query_params.get("token")
+    payload = decode_access_token(token) if token else None
+    if not payload:
+        await websocket.close(code=4401)
+        return
+    try:
+        user_id = int(payload.get("sub"))
+    except (TypeError, ValueError):
+        await websocket.close(code=4401)
+        return
+    if not get_user_by_id(user_id):
+        await websocket.close(code=4401)
+        return
+
     await websocket.accept()
     last_sent_count = -1
     last_product_signature = ""

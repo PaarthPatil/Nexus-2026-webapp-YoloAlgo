@@ -4,6 +4,10 @@ import pathlib
 import shutil
 import statistics
 import subprocess
+import queue
+import threading
+import queue
+import threading
 import time
 from collections import deque, OrderedDict
 from datetime import datetime, timedelta
@@ -175,6 +179,14 @@ class VisionProcessor:
         self.fps_value = 0.0
         self.latest_confidence = 0.0
         self.output_codec = "mp4v"
+
+        
+        self.frame_queue = queue.Queue(maxsize=10)
+        self.frame_skip_n = 2
+        self.last_annotated_frame = None
+        self.reader_thread = None
+        self.worker_thread = None
+
 
     @classmethod
     def normalize_processing_mode(cls, processing_mode):
@@ -582,8 +594,13 @@ class VisionProcessor:
             self._release_resources()
             raise RuntimeError(f"Cannot open video source: {video_source}")
 
-        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
-        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 360)
+        while not self.frame_queue.empty():
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                break
+        self.last_annotated_frame = None
+
         fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 10.0)
         if fps <= 0 or fps > 120:
             fps = 10.0
@@ -593,7 +610,13 @@ class VisionProcessor:
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self.output_codec = "mp4v"
-        self.out = cv2.VideoWriter(self.video_path, fourcc, fps, (width, height))
+        
+        self.frame_queue = queue.Queue(maxsize=10)
+        self.frame_skip_n = 2
+        self.last_annotated_frame = None
+        self.reader_thread = None
+        self.worker_thread = None
+        self.out = cv2.VideoWriter(self.video_path, fourcc, fps, (640, 480))
         if not self.out.isOpened():
             self._release_resources()
             raise RuntimeError("Failed to initialize output video writer.")
@@ -656,6 +679,12 @@ class VisionProcessor:
         final_check_count = self._compute_final_check_count()
         self.final_product_counts = self._compute_final_product_counts()
         self.running = False
+        
+        if getattr(self, 'reader_thread', None) is not None and self.reader_thread.is_alive():
+            self.reader_thread.join(timeout=1.0)
+        if getattr(self, 'worker_thread', None) is not None and self.worker_thread.is_alive():
+            self.worker_thread.join(timeout=1.0)
+            
         self.session_ended_at = datetime.utcnow().isoformat()
         self._release_resources()
         logging.info("Session stopped")
@@ -730,6 +759,8 @@ class VisionProcessor:
         elapsed = max(time.time() - started, 1e-6)
         self.fps_value = 1.0 / elapsed
         self._overlay_runtime(annotated_frame)
+
+        self.last_annotated_frame = annotated_frame
 
         ok, buffer = cv2.imencode(".jpg", annotated_frame)
         if ok:
@@ -1211,15 +1242,72 @@ class VisionProcessor:
             except Exception:
                 logging.exception("Failed to cleanup old video file: %s", path)
 
+    def _frame_reader_loop(self):
+        while self.running and self.cap is not None:
+            ret, frame = self.cap.read()
+            if not ret:
+                logging.info("Video stream ended or frame read failed.")
+                break
+            if self.frame_queue.full():
+                try:
+                    self.frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            self.frame_queue.put(frame)
+
+    def _detection_worker_loop(self):
+        frame_index = 0
+        while self.running:
+            try:
+                frame = self.frame_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            frame_index += 1
+            if frame_index % self.frame_skip_n != 0:
+                if getattr(self, "last_annotated_frame", None) is not None:
+                    if self.out:
+                        self.out.write(self.last_annotated_frame)
+                continue
+            frame_resized = cv2.resize(frame, (640, 480))
+            self.process_frame(frame_resized)
+
+    def _frame_reader_loop(self):
+        while self.running and self.cap is not None:
+            ret, frame = self.cap.read()
+            if not ret:
+                logging.info("Video stream ended or frame read failed.")
+                break
+            if self.frame_queue.full():
+                try:
+                    self.frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            self.frame_queue.put(frame)
+
+    def _detection_worker_loop(self):
+        frame_index = 0
+        while self.running:
+            try:
+                frame = self.frame_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            frame_index += 1
+            if frame_index % self.frame_skip_n != 0:
+                if getattr(self, "last_annotated_frame", None) is not None:
+                    if self.out:
+                        self.out.write(self.last_annotated_frame)
+                continue
+            frame_resized = cv2.resize(frame, (640, 480))
+            self.process_frame(frame_resized)
+
     def run_loop(self):
         try:
-            while self.running and self.cap is not None:
-                ret, frame = self.cap.read()
-                if not ret:
-                    logging.info("Video stream ended or frame read failed.")
-                    break
-                self.process_frame(frame)
-                time.sleep(0.1)  # ~10 FPS for websocket updates
+            self.reader_thread = threading.Thread(target=self._frame_reader_loop, daemon=True)
+            self.worker_thread = threading.Thread(target=self._detection_worker_loop, daemon=True)
+            self.reader_thread.start()
+            self.worker_thread.start()
+            self.reader_thread.join()
+            self.worker_thread.join()
         except Exception:
             logging.exception("Unexpected error in vision run loop")
         finally:

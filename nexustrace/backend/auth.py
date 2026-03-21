@@ -7,8 +7,9 @@ from passlib.context import CryptContext
 SECRET_KEY = os.getenv("NEXUSTRACE_SECRET_KEY", "change-this-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("NEXUSTRACE_ACCESS_TOKEN_MINUTES", "720"))
+BCRYPT_ROUNDS = max(10, min(14, int(os.getenv("NEXUSTRACE_BCRYPT_ROUNDS", "12"))))
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=BCRYPT_ROUNDS)
 
 
 def hash_password(password):

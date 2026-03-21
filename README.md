@@ -182,3 +182,11 @@ xdg-open http://127.0.0.1:5173  # Linux
 - You can also set an explicit path via env var:
   - `NEXUSTRACE_YOLOV5_REPO=/abs/path/to/yolov5` (Linux/macOS)
   - `$env:NEXUSTRACE_YOLOV5_REPO='D:\path\to\yolov5'` (Windows PowerShell)
+
+### Default Login
+
+- Username: `admin`
+- Password: `admin123`
+- Override via env vars:
+  - `NEXUSTRACE_ADMIN_USERNAME`
+  - `NEXUSTRACE_ADMIN_PASSWORD`
