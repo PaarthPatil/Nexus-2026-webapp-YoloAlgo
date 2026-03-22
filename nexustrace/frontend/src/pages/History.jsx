@@ -233,10 +233,10 @@ export function History() {
                   <tr 
                     key={session.id} 
                     onClick={() => setSelectedSessionId(session.id)}
-                    className={`cursor-pointer transition-colors hover:bg-cyan-900/10 ${selectedSessionId === session.id ? 'bg-cyan-900/20' : ''}`}
+                    className={`cursor-pointer transition-all duration-200 hover:bg-cyan-900/10 ${selectedSessionId === session.id ? 'bg-cyan-900/20 shadow-inner' : ''}`}
                   >
                     <td className="px-4 py-3" onClick={(e) => toggleSessionSelection(e, session.id)}>
-                      {selectedSessionIds.has(session.id) ? <CheckSquare className="h-4 w-4 text-cyan-500" /> : <Square className="h-4 w-4 text-slate-700" />}
+                      {selectedSessionIds.has(session.id) ? <CheckSquare className="h-4 w-4 text-cyan-500" /> : <Square className="h-4 w-4 text-slate-700 hover:text-cyan-600 transition-colors" />}
                     </td>
                     <td className="px-4 py-3 font-mono text-cyan-400">#{session.id}</td>
                     <td className="px-4 py-3 text-slate-300">{session.operator_id || '-'}</td>
@@ -256,11 +256,20 @@ export function History() {
 
         {selectedSessionId && (
           <Card className="flex-1 lg:max-w-md border-slate-800/80 bg-slate-900/80 shadow-2xl flex flex-col animate-in slide-in-from-right-8 duration-300">
-            {loadingDetails ? (
-              <div className="flex-1 flex items-center justify-center">
-                <Loader2 className="h-8 w-8 animate-spin text-cyan-600" />
-              </div>
-            ) : sessionDetails ? (
+                {loadingDetails ? (
+                  <div className="p-5 space-y-6 animate-pulse">
+                    <div className="h-8 bg-slate-800 rounded w-1/2"></div>
+                    <div className="flex gap-4">
+                      <div className="h-4 bg-slate-800 rounded w-20"></div>
+                      <div className="h-4 bg-slate-800 rounded w-20"></div>
+                    </div>
+                    <div className="aspect-video bg-slate-800 rounded-lg"></div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="h-10 bg-slate-800 rounded"></div>
+                      <div className="h-10 bg-slate-800 rounded"></div>
+                    </div>
+                  </div>
+                ) : sessionDetails ? (
               <div className="p-5 overflow-auto space-y-6">
                 <div>
                   <h3 className="text-xl font-bold text-slate-100">Session #{sessionDetails.session.id}</h3>

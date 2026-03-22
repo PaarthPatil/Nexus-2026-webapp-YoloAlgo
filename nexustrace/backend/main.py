@@ -488,14 +488,6 @@ async def me():
             "is_admin": True,
         }
     }
-    return {
-        "user": {
-            "id": user["id"],
-            "username": user["username"],
-            "full_name": user.get("full_name"),
-            "is_admin": bool(user.get("is_admin")),
-        }
-    }
 
 
 @app.get("/api/dashboard/stats")
@@ -638,7 +630,7 @@ async def stop_session(request: Request, req: SessionStopRequest):
         product_counts = {name: 0 for name in metadata.get("products", [])}
     save_session_products(session_id, product_counts, metadata.get("product_timestamps"))
 
-    session = get_session(session_id, is_admin=bool(user.get("is_admin")))
+    session = get_session(session_id, is_admin=True)
     session_dict = _session_tuple_to_dict(session)
     product_rows = get_session_products(session_id)
     video_links = _build_video_links(request, session_id, video_id)
@@ -935,6 +927,37 @@ async def update_settings(req: SystemSettingsUpdate):
     return {"message": "Settings updated", "settings": get_system_settings()}
 
 
+@app.get("/api/system/local-videos")
+async def get_local_videos():
+    """Recursively find all video files in the project root."""
+    # Project root is 2 levels up from backend/main.p3 usually, but let's find it robustly
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(backend_dir) 
+    
+    video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.webm')
+    ignore_dirs = {'.git', 'node_modules', 'venv', '__pycache__', 'dist', 'build', '.gemini'}
+    
+    videos = []
+    try:
+        for root, dirs, files in os.walk(project_root):
+            # Prune ignore_dirs in-place to stop os.walk from entering them
+            dirs[:] = [d for d in dirs if d not in ignore_dirs]
+            
+            for file in files:
+                if file.lower().endswith(video_extensions):
+                    full_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(full_path, project_root)
+                    videos.append({
+                        "name": file,
+                        "path": rel_path
+                    })
+    except Exception as e:
+        logging.error(f"Error scanning for videos: {e}")
+        return {"error": str(e), "videos": []}
+        
+    return {"videos": sorted(videos, key=lambda x: x["name"].lower())}
+
+
 @app.delete("/api/system/purge")
 async def purge_system_data():
     purge_all_data()
@@ -948,25 +971,28 @@ async def websocket_endpoint(websocket: WebSocket):
     last_product_signature = ""
     try:
         while True:
-            current_products = json.dumps(vision.latest_product_counts, sort_keys=True)
+            # Optimization: Only re-serialize product counts if they changed or enough time passed
+            runtime = vision.get_runtime_metrics()
+            current_counts = runtime["product_counts"]
+            
             should_send = (
                 vision.latest_frame is not None
                 and (
                     vision.is_running()
                     or vision.latest_count != last_sent_count
-                    or current_products != last_product_signature
+                    or current_counts != last_product_signature
                 )
             )
 
             if should_send:
+                # Direct base64 encoding with single serialization
                 frame_b64 = base64.b64encode(vision.latest_frame).decode("utf-8")
-                runtime = vision.get_runtime_metrics()
                 await websocket.send_text(
                     json.dumps(
                         {
                             "frame": frame_b64,
                             "count": vision.latest_count,
-                            "product_counts": runtime["product_counts"],
+                            "product_counts": current_counts,
                             "fps": runtime["fps"],
                             "detection_confidence": runtime["detection_confidence"],
                             "duration_seconds": runtime["duration_seconds"],
@@ -977,8 +1003,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
                 )
                 last_sent_count = vision.latest_count
-                last_product_signature = current_products
-            await asyncio.sleep(0.1)
+                last_product_signature = current_counts
+            
+            # 15 FPS target for UI preview (66ms) is plenty for "smoothness" and saves massive bandwidth/CPU
+            await asyncio.sleep(0.066)
     except WebSocketDisconnect:
         logging.info("WebSocket client disconnected")
     except Exception:

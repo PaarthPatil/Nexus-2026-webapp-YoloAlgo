@@ -798,7 +798,8 @@ class VisionProcessor:
 
         self.last_annotated_frame = annotated_frame
 
-        ok, buffer = cv2.imencode(".jpg", annotated_frame)
+        # Optimization: Use fixed JPEG quality (75) to balance visual clarity and network latency
+        ok, buffer = cv2.imencode(".jpg", annotated_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
         if ok:
             self.latest_frame = buffer.tobytes()
             self.latest_count = self._compute_live_smoothed_count()

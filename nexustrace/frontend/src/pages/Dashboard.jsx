@@ -22,9 +22,9 @@ const DEFAULT_PROCESSING_OPTIONS = [
   { value: 'run_yoloraspPi.py', label: 'run_yoloraspPi.py (Raspberry Pi)' }
 ];
 
-function MetricCard({ title, value, icon: Icon, colorClass }) {
+const MetricCard = React.memo(function MetricCard({ title, value, icon: Icon, colorClass }) {
   return (
-    <Card className="border-slate-800/60 bg-slate-900/40 hover:bg-slate-900/60 transition-colors">
+    <Card className="border-slate-800/60 bg-slate-900/40 hover:bg-slate-900/60 transition-all duration-300 transform hover:scale-[1.02]">
       <CardContent className="p-4 flex items-center gap-3">
         <div className={`p-2 rounded-lg ${colorClass} bg-opacity-10 border border-current border-opacity-20`}>
           <Icon className="h-4 w-4 opacity-90" />
@@ -36,7 +36,7 @@ function MetricCard({ title, value, icon: Icon, colorClass }) {
       </CardContent>
     </Card>
   );
-}
+});
 
 export function Dashboard() {
   const { apiFetch } = useAuth();
@@ -60,14 +60,14 @@ export function Dashboard() {
   const [roiLabelKeyword, setRoiLabelKeyword] = useState('bigger');
   const [smallLabelKeyword, setSmallLabelKeyword] = useState('box');
   const [productsInput, setProductsInput] = useState('');
-  const [realTime, setRealTime] = useState(false);
-  
   const [addProductsInput, setAddProductsInput] = useState('');
   const [challanProductsInput, setChallanProductsInput] = useState('');
+  const [realTime, setRealTime] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [dashboardStats, setDashboardStats] = useState(null);
+  const [localVideos, setLocalVideos] = useState([]);
 
   useEffect(() => {
     const fetchStatsAndOptions = async () => {
@@ -103,6 +103,12 @@ export function Dashboard() {
           if (s.default_conf_threshold) setConfThreshold(s.default_conf_threshold);
           if (s.default_iou_threshold) setIouThreshold(s.default_iou_threshold);
           if (s.default_roi_padding) setRoiPadding(s.default_roi_padding);
+        }
+
+        const videosRes = await apiFetch(`${API_PREFIX}/system/local-videos`);
+        if (videosRes.ok) {
+          const vData = await videosRes.json();
+          setLocalVideos(vData.videos || []);
         }
       } catch (err) {
         console.error('Failed to fetch dashboard data', err);
@@ -329,7 +335,13 @@ export function Dashboard() {
                     placeholder="URL, Path or 0" 
                     value={videoSource} 
                     onChange={setVideoSource} 
+                    list="local-video-list"
                   />
+                  <datalist id="local-video-list">
+                    {localVideos.map((vid, idx) => (
+                      <option key={idx} value={vid.path}>{vid.name}</option>
+                    ))}
+                  </datalist>
                   <div className="flex items-center justify-between p-3 rounded-lg bg-slate-950/50 border border-slate-800 mt-2">
                     <div className="flex items-center gap-2">
                       <Monitor className="h-4 w-4 text-cyan-400" />
