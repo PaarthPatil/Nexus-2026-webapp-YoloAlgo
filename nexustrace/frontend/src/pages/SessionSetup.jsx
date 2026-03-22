@@ -10,8 +10,8 @@ import { useNavigate } from 'react-router-dom';
 import { readApiError, safeOpenInNewTab } from '../lib/api';
 
 const DEFAULT_PROCESSING_OPTIONS = [
-  { value: 'run_yolo.py', label: 'run_yolo.py (YOLOv2 Baseline)' },
-  { value: 'run_yolo2.py', label: 'run_yolo2.py (YOLOv2 Style)' },
+  { value: 'nexus_optimized', label: 'Nexus Optimized (Accurate)' },
+  { value: 'run_yolo_nexus_optimized.py', label: 'run_yolo_nexus_optimized.py (High Accuracy)' },
   { value: 'run_yolo3.py', label: 'run_yolo3.py (YOLOv3 Optimized)' },
   { value: 'run_yolo4.py', label: 'run_yolo4.py (YOLOv4 Optimized)' },
   { value: 'run_yolo5.py', label: 'run_yolo5.py (YOLOv5 Hysteresis)' },
@@ -63,22 +63,34 @@ export function SessionSetup() {
   useEffect(() => {
     const fetchSessionOptions = async () => {
       try {
-        const res = await apiFetch(`${API_PREFIX}/sessions/options`);
-        if (!res.ok) return;
-        const data = await res.json();
-        
-        const scriptOptions = (data.runner_scripts || []).map(item => ({
-          value: item.script_name,
-          label: item.label ? `${item.script_name} (${item.label})` : item.script_name
-        }));
-        if (scriptOptions.length) {
-          setProcessingOptions(scriptOptions);
+        const [optionsRes, settingsRes] = await Promise.all([
+          apiFetch(`${API_PREFIX}/sessions/options`),
+          apiFetch(`${API_PREFIX}/system/settings`)
+        ]);
+
+        if (optionsRes.ok) {
+          const data = await optionsRes.json();
+          const scriptOptions = (data.runner_scripts || []).map(item => ({
+            value: item.script_name,
+            label: item.label ? `${item.script_name} (${item.label})` : item.script_name
+          }));
+          if (scriptOptions.length) {
+            setProcessingOptions(scriptOptions);
+          }
+
+          const nextModelOptions = (data.model_files || []).map(item => ({
+            value: item.path, label: item.name || item.path
+          }));
+          setModelOptions(nextModelOptions);
         }
 
-        const nextModelOptions = (data.model_files || []).map(item => ({
-          value: item.path, label: item.name || item.path
-        }));
-        setModelOptions(nextModelOptions);
+        if (settingsRes.ok) {
+          const sData = await settingsRes.json();
+          const s = sData.settings || {};
+          if (s.default_conf_threshold) setConfThreshold(s.default_conf_threshold);
+          if (s.default_iou_threshold) setIouThreshold(s.default_iou_threshold);
+          if (s.default_roi_padding) setRoiPadding(s.default_roi_padding);
+        }
       } catch (err) {
         console.error('Failed to fetch session setup options', err);
       }

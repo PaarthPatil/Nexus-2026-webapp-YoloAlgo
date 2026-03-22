@@ -784,6 +784,8 @@ class VisionProcessor:
             annotated_frame, frame_count, product_counts, confidences = self._process_frame_yolo5(frame)
         elif self.processing_mode == "yolorasppi":
             annotated_frame, frame_count, product_counts, confidences = self._process_frame_yolorasppi(frame)
+        elif self.processing_mode == "nexus_optimized":
+            annotated_frame, frame_count, product_counts, confidences = self._process_frame_nexus_optimized(frame)
         else:
             annotated_frame, frame_count, product_counts, confidences = self._process_frame_yolo2(frame)
 

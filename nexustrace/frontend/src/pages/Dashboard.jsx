@@ -72,9 +72,10 @@ export function Dashboard() {
   useEffect(() => {
     const fetchStatsAndOptions = async () => {
       try {
-        const [statsRes, optionsRes] = await Promise.all([
+        const [statsRes, optionsRes, settingsRes] = await Promise.all([
           apiFetch(`${API_PREFIX}/dashboard/stats`),
-          apiFetch(`${API_PREFIX}/sessions/options`)
+          apiFetch(`${API_PREFIX}/sessions/options`),
+          apiFetch(`${API_PREFIX}/system/settings`)
         ]);
 
         if (statsRes.ok) {
@@ -94,6 +95,14 @@ export function Dashboard() {
             value: item.path, label: item.name || item.path
           }));
           setModelOptions(nextModelOptions);
+        }
+
+        if (settingsRes.ok) {
+          const sData = await settingsRes.json();
+          const s = sData.settings || {};
+          if (s.default_conf_threshold) setConfThreshold(s.default_conf_threshold);
+          if (s.default_iou_threshold) setIouThreshold(s.default_iou_threshold);
+          if (s.default_roi_padding) setRoiPadding(s.default_roi_padding);
         }
       } catch (err) {
         console.error('Failed to fetch dashboard data', err);

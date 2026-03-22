@@ -121,6 +121,32 @@ def init_db():
         cursor.execute("ALTER TABLE videos ADD COLUMN created_at TEXT")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_videos_session_id ON videos(session_id)")
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    # Default settings
+    default_settings = [
+        ("company_name", "Nexus Industrial Trace", "2026-03-22T20:15:00Z"),
+        ("company_address", "Global HQ, Tech Sector 7", "2026-03-22T20:15:00Z"),
+        ("company_contact", "+1-800-NEXUS-01", "2026-03-22T20:15:00Z"),
+        ("company_gst_id", "GST-NEXUS-7788", "2026-03-22T20:15:00Z"),
+        ("company_logo_url", "", "2026-03-22T20:15:00Z"),
+        ("default_conf_threshold", "0.50", "2026-03-22T20:15:00Z"),
+        ("default_iou_threshold", "0.65", "2026-03-22T20:15:00Z"),
+        ("default_roi_padding", "5", "2026-03-22T20:15:00Z"),
+        ("retention_days", "30", "2026-03-22T20:15:00Z"),
+    ]
+    cursor.executemany(
+        "INSERT OR IGNORE INTO system_settings (key, value, updated_at) VALUES (?, ?, ?)",
+        default_settings
+    )
+
     conn.commit()
     conn.close()
 
@@ -608,3 +634,54 @@ def get_dashboard_stats(created_by: Optional[int] = None, is_admin: bool = False
         "recent_sessions": recent,
         "top_products": top_products,
     }
+def get_system_settings():
+    ensure_app_dirs()
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT key, value FROM system_settings")
+    rows = cursor.fetchall()
+    conn.close()
+    return {row["key"]: row["value"] for row in rows}
+
+
+def update_system_setting(key, value):
+    ensure_app_dirs()
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES (?, ?, ?)",
+        (key, str(value), _utcnow_iso()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def purge_all_data():
+    ensure_app_dirs()
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM session_products")
+    cursor.execute("DELETE FROM videos")
+    cursor.execute("DELETE FROM sessions")
+    conn.commit()
+    conn.close()
+
+
+def get_sessions_by_ids(session_ids: list):
+    ensure_app_dirs()
+    if not session_ids:
+        return []
+    conn = _connect()
+    cursor = conn.cursor()
+    placeholders = ",".join("?" for _ in session_ids)
+    cursor.execute(
+        f"""
+        SELECT * FROM sessions 
+        WHERE id IN ({placeholders})
+        ORDER BY timestamp DESC
+        """,
+        tuple(session_ids),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [tuple(row) for row in rows]

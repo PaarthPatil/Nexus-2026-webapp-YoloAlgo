@@ -4,7 +4,7 @@ import { Card } from '../components/ui/Card';
 import { Input } from '../components/ui/Input';
 import { Select } from '../components/ui/Select';
 import { Button } from '../components/ui/Button';
-import { FileText, Download, Loader2 } from 'lucide-react';
+import { FileText, Download, Loader2, CheckSquare, Square, XCircle } from 'lucide-react';
 import { readApiError, safeOpenInNewTab } from '../lib/api';
 
 const formatDateTime = (isoText) => {
@@ -22,8 +22,11 @@ export function History() {
   const [filters, setFilters] = useState({ search: '', operator_id: '', product_name: '' });
   
   const [selectedSessionId, setSelectedSessionId] = useState(null);
+  const [selectedSessionIds, setSelectedSessionIds] = useState(new Set());
+  
   const [sessionDetails, setSessionDetails] = useState(null);
   const [loadingDetails, setLoadingDetails] = useState(false);
+  const [generatingMulti, setGeneratingMulti] = useState(false);
   const [error, setError] = useState('');
 
   useEffect(() => {
@@ -90,6 +93,24 @@ export function History() {
     fetchDetails();
   }, [apiFetch, selectedSessionId]);
 
+  const toggleSessionSelection = (e, sid) => {
+    e.stopPropagation();
+    setSelectedSessionIds(prev => {
+      const next = new Set(prev);
+      if (next.has(sid)) next.delete(sid);
+      else next.add(sid);
+      return next;
+    });
+  };
+
+  const selectAll = () => {
+    if (selectedSessionIds.size === sessions.length) {
+      setSelectedSessionIds(new Set());
+    } else {
+      setSelectedSessionIds(new Set(sessions.map(s => s.id)));
+    }
+  };
+
   const handleDownloadChallan = async (sessionId) => {
     try {
       const res = await apiFetch(`${API_PREFIX}/challans/generate`, {
@@ -99,28 +120,52 @@ export function History() {
       });
       if (!res.ok) throw new Error(await readApiError(res, 'Failed to generate challan'));
       const data = await res.json();
-      if (!data.challan_file) throw new Error('The server did not return a challan file.');
-
-      const fileRes = await apiFetch(`${API_PREFIX}/challans/files/${encodeURIComponent(data.challan_file)}`);
-      if (!fileRes.ok) throw new Error(await readApiError(fileRes, 'Failed to download challan'));
-
-      const blob = await fileRes.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = data.challan_file;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      window.URL.revokeObjectURL(url);
-      setError('');
+      downloadFile(data.challan_file);
     } catch (err) {
       setError(err.message || `Failed to download challan for session ${sessionId}.`);
     }
   };
 
+  const handleBatchChallan = async () => {
+    setGeneratingMulti(true);
+    try {
+      const res = await apiFetch(`${API_PREFIX}/challans/generate-multi`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_ids: Array.from(selectedSessionIds) })
+      });
+      if (!res.ok) throw new Error(await readApiError(res, 'Failed to generate batch challan'));
+      const data = await res.json();
+      downloadFile(data.challan_file);
+      setError('');
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setGeneratingMulti(false);
+    }
+  };
+
+  const downloadFile = async (fileName) => {
+    try {
+      const fileRes = await apiFetch(`${API_PREFIX}/challans/files/${encodeURIComponent(fileName)}`);
+      if (!fileRes.ok) throw new Error(await readApiError(fileRes, 'Failed to download file'));
+
+      const blob = await fileRes.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
   return (
-    <div className="h-full flex flex-col space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500 max-h-[calc(100vh-6rem)]">
+    <div className="h-full flex flex-col space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500 max-height-[calc(100vh-6rem)] relative">
       <div>
         <h1 className="text-2xl font-bold tracking-tight text-slate-100">Session Audit History</h1>
         <p className="text-sm text-slate-400 mt-1">Review past inspections, generate challans, and playback surveillance logs.</p>
@@ -132,17 +177,38 @@ export function History() {
         </div>
       )}
 
-      <div className="flex flex-wrap gap-4 items-end">
-        <div className="w-full md:w-64">
-          <Input placeholder="Search batch or operator" value={filters.search} onChange={(e) => setFilters(prev => ({...prev, search: e}))} />
+      <div className="flex flex-wrap gap-4 items-end justify-between">
+        <div className="flex gap-4 items-end flex-wrap">
+          <div className="w-full md:w-64">
+            <Input placeholder="Search batch or operator" value={filters.search} onChange={(e) => setFilters(prev => ({...prev, search: e}))} />
+          </div>
+          <div className="w-full md:w-48">
+            <Select 
+              options={[{value: '', label: 'All Operators'}, ...historyOptions.operators.map(o => ({value:o}))]} 
+              value={filters.operator_id} 
+              onChange={(e) => setFilters(prev => ({...prev, operator_id: e}))} 
+            />
+          </div>
         </div>
-        <div className="w-full md:w-48">
-          <Select 
-            options={[{value: '', label: 'All Operators'}, ...historyOptions.operators.map(o => ({value:o}))]} 
-            value={filters.operator_id} 
-            onChange={(e) => setFilters(prev => ({...prev, operator_id: e}))} 
-          />
-        </div>
+
+        {selectedSessionIds.size > 0 && (
+          <div className="flex items-center gap-3 animate-in fade-in slide-in-from-right-4">
+            <span className="text-xs font-bold text-cyan-500 uppercase tracking-widest bg-cyan-950/30 px-3 py-1.5 rounded-full border border-cyan-800/50">
+              {selectedSessionIds.size} Sessions Selected
+            </span>
+            <Button 
+               onClick={handleBatchChallan} 
+               disabled={generatingMulti}
+               className="bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-900/20 h-9"
+            >
+              {generatingMulti ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <Download className="h-4 w-4 mr-2" />}
+              Generate Batch Challan
+            </Button>
+            <Button variant="ghost" className="text-slate-400 hover:text-red-400 h-9 px-2" onClick={() => setSelectedSessionIds(new Set())}>
+              <XCircle className="h-4 w-4" />
+            </Button>
+          </div>
+        )}
       </div>
 
       <div className="flex-1 min-h-0 flex flex-col lg:flex-row gap-6">
@@ -151,6 +217,11 @@ export function History() {
             <table className="w-full text-sm text-left border-collapse">
               <thead className="bg-slate-950/80 text-slate-400 sticky top-0 z-10 backdrop-blur-md border-b border-slate-800">
                 <tr>
+                  <th className="px-4 py-3 w-10">
+                    <button onClick={selectAll} className="text-slate-500 hover:text-cyan-400 transition-colors">
+                      {selectedSessionIds.size === sessions.length && sessions.length > 0 ? <CheckSquare className="h-4 w-4 text-cyan-500" /> : <Square className="h-4 w-4" />}
+                    </button>
+                  </th>
                   <th className="px-4 py-3 font-medium">Session ID</th>
                   <th className="px-4 py-3 font-medium">Operator</th>
                   <th className="px-4 py-3 font-medium">Count</th>
@@ -162,8 +233,11 @@ export function History() {
                   <tr 
                     key={session.id} 
                     onClick={() => setSelectedSessionId(session.id)}
-                    className={`cursor-pointer transition-colors hover:bg-cyan-900/20 ${selectedSessionId === session.id ? 'bg-cyan-900/30 border-l-2 border-cyan-500' : 'border-l-2 border-transparent'}`}
+                    className={`cursor-pointer transition-colors hover:bg-cyan-900/10 ${selectedSessionId === session.id ? 'bg-cyan-900/20' : ''}`}
                   >
+                    <td className="px-4 py-3" onClick={(e) => toggleSessionSelection(e, session.id)}>
+                      {selectedSessionIds.has(session.id) ? <CheckSquare className="h-4 w-4 text-cyan-500" /> : <Square className="h-4 w-4 text-slate-700" />}
+                    </td>
                     <td className="px-4 py-3 font-mono text-cyan-400">#{session.id}</td>
                     <td className="px-4 py-3 text-slate-300">{session.operator_id || '-'}</td>
                     <td className="px-4 py-3 font-semibold text-slate-200">{session.final_count}</td>
@@ -172,7 +246,7 @@ export function History() {
                 ))}
                 {!sessions.length && (
                   <tr>
-                    <td colSpan={4} className="px-4 py-8 text-center text-slate-500">No telemetry data found for these filters.</td>
+                    <td colSpan={5} className="px-4 py-8 text-center text-slate-500">No telemetry data found for these filters.</td>
                   </tr>
                 )}
               </tbody>
@@ -207,8 +281,8 @@ export function History() {
                 )}
 
                 <div className="grid grid-cols-2 gap-3 mb-2">
-                  <Button variant="secondary" className="w-full bg-cyan-700/80 hover:bg-cyan-600/80 text-white border border-cyan-500/50 shadow-[0_0_15px_rgba(6,182,212,0.15)]" onClick={() => handleDownloadChallan(selectedSessionId)}>
-                    <Download className="h-4 w-4 mr-2" /> Download Challan PDF
+                  <Button variant="secondary" className="w-full bg-cyan-700/80 hover:bg-cyan-600/80 text-white border border-cyan-500/50" onClick={() => handleDownloadChallan(selectedSessionId)}>
+                    <Download className="h-4 w-4 mr-2" /> Single Challan
                   </Button>
                   {sessionDetails.video_url && (
                     <Button variant="outline" className="w-full border-indigo-500/30 text-indigo-400 hover:bg-indigo-500/10" onClick={() => safeOpenInNewTab(`${sessionDetails.video_url}${sessionDetails.video_url.includes('?') ? '&' : '?'}token=${authToken}`)}>

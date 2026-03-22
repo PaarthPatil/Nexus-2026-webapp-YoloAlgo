@@ -223,3 +223,93 @@ def generate_challan(
     path = CHALLANS_DIR / file_name
     pdf.output(str(path))
     return str(path)
+
+
+def generate_multi_session_challan(
+    sessions,
+    output_basename=None,
+    company_profile=None,
+):
+    ensure_app_dirs()
+    if not sessions:
+        raise ValueError("No sessions provided for multi-challan generation.")
+
+    # Calculate aggregate total box count
+    total_count = sum(int(s[4] if isinstance(s, tuple) else s.get("final_count") or 0) for s in sessions)
+    from datetime import datetime
+    generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    if __package__:
+        from .config import COMPANY_NAME, COMPANY_ADDRESS, COMPANY_CONTACT, COMPANY_GST_ID, COMPANY_LOGO_PATH, CHALLANS_DIR
+    else:
+        from config import COMPANY_NAME, COMPANY_ADDRESS, COMPANY_CONTACT, COMPANY_GST_ID, COMPANY_LOGO_PATH, CHALLANS_DIR
+
+    merged_company_profile = {
+        "name": COMPANY_NAME,
+        "address": COMPANY_ADDRESS,
+        "contact": COMPANY_CONTACT,
+        "gst_id": COMPANY_GST_ID,
+        "logo_path": COMPANY_LOGO_PATH,
+    }
+    if isinstance(company_profile, dict):
+        merged_company_profile.update(company_profile)
+
+    pdf = ChallanPDF(company_profile=merged_company_profile)
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.add_page()
+    
+    # Title Section
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.set_text_color(24, 42, 74)
+    pdf.cell(0, 10, "Multi-Session Summary Report", ln=True, align="C")
+    pdf.set_font("Helvetica", "I", 9)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 6, f"Generated at: {generated_at}", ln=True, align="C")
+    pdf.ln(8)
+
+    # Table Header
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_fill_color(240, 240, 240)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(25, 9, "Session ID", border=1, fill=True)
+    pdf.cell(35, 9, "Operator", border=1, fill=True)
+    pdf.cell(40, 9, "Batch ID", border=1, fill=True)
+    pdf.cell(55, 9, "Timestamp", border=1, fill=True)
+    pdf.cell(35, 9, "Count", border=1, fill=True, ln=True)
+
+    # Table Body
+    pdf.set_font("Helvetica", "", 10)
+    for s in sessions:
+        # Handle tuple (from database) or dict (from API)
+        if isinstance(s, tuple):
+            sid, ts, op, batch, count = s[0], s[1], s[2], s[3], s[4]
+        else:
+            sid, ts, op, batch, count = s.get("id"), s.get("timestamp"), s.get("operator_id"), s.get("batch_id"), s.get("final_count")
+            
+        pdf.cell(25, 8, f"#{sid}", border=1)
+        pdf.cell(35, 8, _safe_value(op, "N/A"), border=1)
+        pdf.cell(40, 8, _safe_value(batch, "N/A"), border=1)
+        
+        try:
+            ts_str = str(ts or "")
+            dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            ts_display = dt.strftime("%d/%m/%y %H:%M")
+        except Exception:
+            ts_display = str(ts or "N/A")[:16]
+            
+        pdf.cell(55, 8, ts_display, border=1)
+        pdf.cell(35, 8, str(count or 0), border=1, ln=True, align="C")
+
+    # Grand Total Footer
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(155, 10, "GRAND TOTAL", border=1, align="R")
+    pdf.cell(35, 10, str(total_count), border=1, ln=True, align="C")
+
+    pdf.ln(10)
+    pdf.set_font("Helvetica", "I", 9)
+    pdf.multi_cell(0, 6, "System Generated Consolidated Report. This document summarizes multiple operational inspection records for auditing purposes.")
+
+    file_name = output_basename or f"multi_challan_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
+    path = CHALLANS_DIR / file_name
+    pdf.output(str(path))
+    return str(path)

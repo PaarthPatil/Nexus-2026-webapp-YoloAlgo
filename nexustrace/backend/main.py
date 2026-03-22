@@ -47,9 +47,13 @@ if __package__:
         save_session_products,
         save_video_metadata,
         update_session_video_path,
+        get_system_settings,
+        update_system_setting,
+        purge_all_data,
+        get_sessions_by_ids,
     )
     from .auth import create_access_token, decode_access_token, hash_password, verify_password
-    from .pdf_generator import generate_challan
+    from .pdf_generator import generate_challan, generate_multi_session_challan
     from .vision import VisionProcessor
 else:
     from database import (
@@ -71,9 +75,13 @@ else:
         save_session_products,
         save_video_metadata,
         update_session_video_path,
+        get_system_settings,
+        update_system_setting,
+        purge_all_data,
+        get_sessions_by_ids,
     )
     from auth import create_access_token, decode_access_token, hash_password, verify_password
-    from pdf_generator import generate_challan
+    from pdf_generator import generate_challan, generate_multi_session_challan
     from vision import VisionProcessor
 
 logging.basicConfig(filename=str(LOGS_DIR / "nexustrace.log"), level=logging.INFO)
@@ -194,6 +202,14 @@ class AddProductsRequest(BaseModel):
 class ChallanGenerateRequest(BaseModel):
     session_id: int
     products: Optional[List[str]] = None
+
+
+class MultiChallanRequest(BaseModel):
+    session_ids: List[int]
+
+
+class SystemSettingsUpdate(BaseModel):
+    settings: dict
 
 
 @app.middleware("http")
@@ -869,6 +885,60 @@ async def get_challan(session_id: int, request: Request):
     if not challan_path.exists():
         raise HTTPException(status_code=404, detail="Challan file not found")
     return FileResponse(str(challan_path), media_type="application/pdf", filename=challan_path.name)
+
+
+@app.post("/api/challans/generate-multi")
+async def generate_multi_challan(req: MultiChallanRequest):
+    session_ids = req.session_ids
+    if not session_ids:
+        raise HTTPException(status_code=400, detail="session_ids are required")
+    
+    sessions = get_sessions_by_ids(session_ids)
+    if not sessions:
+        raise HTTPException(status_code=404, detail="No sessions found")
+        
+    sessions_dicts = [_session_tuple_to_dict(s) for s in sessions]
+    settings = get_system_settings()
+    
+    try:
+        challan_path = generate_multi_session_challan(
+            sessions=sessions_dicts,
+            company_profile={
+                "name": settings.get("company_name"),
+                "address": settings.get("company_address"),
+                "contact": settings.get("company_contact"),
+                "gst_id": settings.get("company_gst_id"),
+                "logo_url": settings.get("company_logo_url")
+            }
+        )
+    except Exception as e:
+        logging.exception("Failed to generate multi-challan")
+        raise HTTPException(status_code=500, detail=str(e))
+        
+    return {
+        "message": "Multi-session challan generated",
+        "challan_path": challan_path,
+        "challan_file": Path(challan_path).name,
+        "session_count": len(sessions_dicts)
+    }
+
+
+@app.get("/api/system/settings")
+async def get_settings():
+    return {"settings": get_system_settings()}
+
+
+@app.put("/api/system/settings")
+async def update_settings(req: SystemSettingsUpdate):
+    for key, value in req.settings.items():
+        update_system_setting(key, value)
+    return {"message": "Settings updated", "settings": get_system_settings()}
+
+
+@app.delete("/api/system/purge")
+async def purge_system_data():
+    purge_all_data()
+    return {"message": "All session and video data has been purged."}
 
 
 @app.websocket("/ws/live-feed")
