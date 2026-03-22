@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 websockets
 ultralytics
+lap>=0.5.12
 numpy<2.0
 pandas<2.3
 opencv-python-headless==4.10.0.84
@@ -13,7 +14,8 @@ scipy>=1.11,<2.0
 seaborn>=0.13,<0.14
 tqdm>=4.66,<5.0
 fpdf2
+httpx<1.0
 torch
 python-multipart
 python-jose[cryptography]
-passlib[bcrypt]
+bcrypt>=4,<5

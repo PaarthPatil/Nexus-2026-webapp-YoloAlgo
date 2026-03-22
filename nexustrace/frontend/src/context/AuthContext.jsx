@@ -1,4 +1,6 @@
+/* eslint-disable react-refresh/only-export-components */
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { readApiError } from '../lib/api';
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
 export const API_PREFIX = API_BASE_URL.endsWith('/api') ? API_BASE_URL : `${API_BASE_URL}/api`;
@@ -52,26 +54,29 @@ export function AuthProvider({ children }) {
   }, [validateToken]);
 
   const login = async (username, password) => {
-    const res = await fetch(`${API_PREFIX}/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password })
-    });
-    if (!res.ok) {
-      let detail = 'Login failed';
-      try {
-        const data = await res.json();
-        if (data?.detail) detail = data.detail;
-      } catch (_) {}
-      throw new Error(detail);
+    try {
+      const res = await fetch(`${API_PREFIX}/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+      });
+      if (!res.ok) {
+        throw new Error(await readApiError(res, 'Login failed'));
+      }
+
+      const data = await res.json();
+      const token = String(data.access_token || '');
+      if (!token) throw new Error('No access token returned');
+
+      localStorage.setItem('nexustrace_token', token);
+      setAuthToken(token);
+      setCurrentUser(data.user || null);
+    } catch (error) {
+      if (error instanceof Error) {
+        throw error;
+      }
+      throw new Error('Unable to reach the server. Please verify the backend is running.');
     }
-    const data = await res.json();
-    const token = String(data.access_token || '');
-    if (!token) throw new Error('No access token returned');
-    
-    localStorage.setItem('nexustrace_token', token);
-    setAuthToken(token);
-    setCurrentUser(data.user || null);
   };
 
   const logout = useCallback(() => {

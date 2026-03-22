@@ -1,7 +1,8 @@
 import React, { forwardRef } from 'react';
-import { cn } from '../lib/utils';
+import { cn } from '../../lib/utils';
 
-export const Input = forwardRef(({ className, type, label, error, ...props }, ref) => {
+export const Input = forwardRef(({ className, type, label, error, onChange, ...props }, ref) => {
+  const handleChange = onChange ? (e) => onChange(e.target.value) : undefined;
   return (
     <div className="w-full">
       {label && (
@@ -17,6 +18,7 @@ export const Input = forwardRef(({ className, type, label, error, ...props }, re
           className
         )}
         ref={ref}
+        onChange={handleChange}
         {...props}
       />
       {error && <p className="mt-1.5 text-xs text-red-400">{error}</p>}

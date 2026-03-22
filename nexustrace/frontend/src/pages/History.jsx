@@ -1,10 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth, API_PREFIX } from '../context/AuthContext';
-import { Card, CardContent } from '../components/ui/Card';
+import { Card } from '../components/ui/Card';
 import { Input } from '../components/ui/Input';
 import { Select } from '../components/ui/Select';
 import { Button } from '../components/ui/Button';
-import { FileText, Download, Share2, Eye, FileOutput, Loader2 } from 'lucide-react';
+import { FileText, Download, Loader2 } from 'lucide-react';
+import { readApiError, safeOpenInNewTab } from '../lib/api';
 
 const formatDateTime = (isoText) => {
   if (!isoText) return '-';
@@ -14,7 +15,7 @@ const formatDateTime = (isoText) => {
 };
 
 export function History() {
-  const { apiFetch } = useAuth();
+  const { apiFetch, authToken } = useAuth();
   
   const [sessions, setSessions] = useState([]);
   const [historyOptions, setHistoryOptions] = useState({ operators: [], products: [] });
@@ -23,6 +24,7 @@ export function History() {
   const [selectedSessionId, setSelectedSessionId] = useState(null);
   const [sessionDetails, setSessionDetails] = useState(null);
   const [loadingDetails, setLoadingDetails] = useState(false);
+  const [error, setError] = useState('');
 
   useEffect(() => {
     const fetchOptions = async () => {
@@ -31,8 +33,11 @@ export function History() {
         if (res.ok) {
           const data = await res.json();
           setHistoryOptions({ operators: data.operators || [], products: data.products || [] });
+          setError('');
         }
-      } catch (err) {}
+      } catch (err) {
+        setError(err.message || 'Failed to fetch history filter options.');
+      }
     };
     fetchOptions();
   }, [apiFetch]);
@@ -50,8 +55,11 @@ export function History() {
         if (res.ok) {
           const data = await res.json();
           setSessions(data.sessions || []);
+          setError('');
         }
-      } catch (err) {}
+      } catch (err) {
+        setError(err.message || 'Failed to fetch session history.');
+      }
     };
     const to = setTimeout(fetchHistory, 300);
     return () => clearTimeout(to);
@@ -68,8 +76,15 @@ export function History() {
         const res = await apiFetch(`${API_PREFIX}/sessions/${selectedSessionId}/details`);
         if (res.ok) {
           setSessionDetails(await res.json());
+          setError('');
+        } else {
+          setSessionDetails(null);
+          setError(await readApiError(res, 'Failed to fetch session details.'));
         }
-      } catch (err) {}
+      } catch (err) {
+        setSessionDetails(null);
+        setError(err.message || `Failed to fetch details for session ${selectedSessionId}.`);
+      }
       setLoadingDetails(false);
     };
     fetchDetails();
@@ -82,24 +97,26 @@ export function History() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sessionId })
       });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.challan_file) {
-          const fileRes = await apiFetch(`${API_PREFIX}/challans/files/${encodeURIComponent(data.challan_file)}`);
-          if (fileRes.ok) {
-            const blob = await fileRes.blob();
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = data.challan_file;
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            window.URL.revokeObjectURL(url);
-          }
-        }
-      }
-    } catch (err) {}
+      if (!res.ok) throw new Error(await readApiError(res, 'Failed to generate challan'));
+      const data = await res.json();
+      if (!data.challan_file) throw new Error('The server did not return a challan file.');
+
+      const fileRes = await apiFetch(`${API_PREFIX}/challans/files/${encodeURIComponent(data.challan_file)}`);
+      if (!fileRes.ok) throw new Error(await readApiError(fileRes, 'Failed to download challan'));
+
+      const blob = await fileRes.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = data.challan_file;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+      setError('');
+    } catch (err) {
+      setError(err.message || `Failed to download challan for session ${sessionId}.`);
+    }
   };
 
   return (
@@ -108,6 +125,12 @@ export function History() {
         <h1 className="text-2xl font-bold tracking-tight text-slate-100">Session Audit History</h1>
         <p className="text-sm text-slate-400 mt-1">Review past inspections, generate challans, and playback surveillance logs.</p>
       </div>
+
+      {error && (
+        <div className="rounded-lg border border-red-900/50 bg-red-950/30 px-4 py-3 text-sm text-red-300">
+          {error}
+        </div>
+      )}
 
       <div className="flex flex-wrap gap-4 items-end">
         <div className="w-full md:w-64">
@@ -175,7 +198,7 @@ export function History() {
 
                 {sessionDetails.video_url ? (
                   <div className="rounded-lg overflow-hidden border border-slate-800 bg-black aspect-video relative group">
-                    <video src={sessionDetails.video_url} controls className="w-full h-full object-contain" />
+                    <video src={`${sessionDetails.video_url}${sessionDetails.video_url.includes('?') ? '&' : '?'}token=${authToken}`} controls className="w-full h-full object-contain" />
                   </div>
                 ) : (
                   <div className="aspect-video bg-slate-950 border border-slate-800 rounded-lg flex items-center justify-center text-slate-500 text-sm">
@@ -188,7 +211,7 @@ export function History() {
                     <Download className="h-4 w-4 mr-2" /> Download Challan PDF
                   </Button>
                   {sessionDetails.video_url && (
-                    <Button variant="outline" className="w-full border-indigo-500/30 text-indigo-400 hover:bg-indigo-500/10" onClick={() => window.open(sessionDetails.video_url, '_blank')}>
+                    <Button variant="outline" className="w-full border-indigo-500/30 text-indigo-400 hover:bg-indigo-500/10" onClick={() => safeOpenInNewTab(`${sessionDetails.video_url}${sessionDetails.video_url.includes('?') ? '&' : '?'}token=${authToken}`)}>
                       <FileText className="h-4 w-4 mr-2" /> Play Original
                     </Button>
                   )}

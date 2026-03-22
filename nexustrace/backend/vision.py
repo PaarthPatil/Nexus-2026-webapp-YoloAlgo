@@ -6,8 +6,6 @@ import statistics
 import subprocess
 import queue
 import threading
-import queue
-import threading
 import time
 from collections import deque, OrderedDict
 from datetime import datetime, timedelta
@@ -112,6 +110,7 @@ class VisionProcessor:
         "yolo4": "YOLOv4 Optimized (run_yolo4.py)",
         "yolo5": "YOLOv5 Hysteresis (run_yolo5.py)",
         "yolorasppi": "YOLO Raspberry Pi (run_yoloraspPi.py)",
+        "nexus_optimized": "Nexus Optimized (Accurate)",
     }
     MODE_ALIASES = {
         "run_yolo.py": "yolo2",
@@ -128,6 +127,8 @@ class VisionProcessor:
         "yolo_raspi": "yolorasppi",
         "yolorasp-pi": "yolorasppi",
         "run_yolorasppi.py": "yolorasppi",
+        "nexus_optimized": "nexus_optimized",
+        "run_yolo_nexus_optimized.py": "nexus_optimized",
     }
     SUPPORTED_PROCESSING_MODES = set(MODE_LABELS.keys())
 
@@ -145,6 +146,8 @@ class VisionProcessor:
         self.roi_label_keyword = "bigger"
         self.small_label_keyword = "box"
         self.yolov5_repo_path = None
+        self.real_time = False
+
         self.bigger_box_classes = []
         self.small_box_classes = []
         self.cumulative_unique_count = 0
@@ -181,8 +184,8 @@ class VisionProcessor:
         self.output_codec = "mp4v"
 
         
-        self.frame_queue = queue.Queue(maxsize=10)
-        self.frame_skip_n = 2
+        self.frame_queue = queue.Queue(maxsize=30)
+        self.frame_skip_n = 1
         self.last_annotated_frame = None
         self.reader_thread = None
         self.worker_thread = None
@@ -355,6 +358,9 @@ class VisionProcessor:
         self.model = YOLO(self.model_path)
 
     def _resolve_yolov5_repo_path(self, repo_path=None):
+        def _is_valid_repo(candidate_path: Path):
+            return candidate_path.exists() and candidate_path.is_dir() and (candidate_path / "hubconf.py").exists()
+
         raw = str(repo_path).strip() if repo_path is not None else ""
         project_root = Path(__file__).resolve().parents[2]
         backend_root = Path(__file__).resolve().parent
@@ -369,13 +375,16 @@ class VisionProcessor:
                 backend_root / raw_path,
             ]
             for candidate in search_paths:
-                if candidate.exists():
+                if _is_valid_repo(candidate):
                     return str(candidate.resolve())
+            raise FileNotFoundError(
+                f"Invalid YOLOv5 repo path '{raw}'. Provide the repo root containing hubconf.py."
+            )
 
         env_repo = os.getenv("NEXUSTRACE_YOLOV5_REPO", "").strip()
         if env_repo:
             env_path = Path(env_repo)
-            if env_path.exists():
+            if _is_valid_repo(env_path):
                 return str(env_path.resolve())
 
         for candidate in [
@@ -385,7 +394,7 @@ class VisionProcessor:
             Path("yolov5"),
             Path("D:/Nexus/yolov5"),
         ]:
-            if candidate.exists():
+            if _is_valid_repo(candidate):
                 return str(candidate.resolve())
 
         raise FileNotFoundError(
@@ -410,7 +419,23 @@ class VisionProcessor:
         if os.name == "nt":
             pathlib.PosixPath = pathlib.WindowsPath
 
-        self.model = torch.hub.load(yolov5_repo_path, "custom", path=model_path, source="local")
+        try:
+            self.model = torch.hub.load(yolov5_repo_path, "custom", path=model_path, source="local")
+        except ModuleNotFoundError as exc:
+            missing_pkg = exc.name or "unknown"
+            raise RuntimeError(
+                f"Missing Python dependency '{missing_pkg}' for YOLOv5 local repo mode. "
+                "Install backend requirements and restart the backend."
+            ) from exc
+        except ImportError as exc:
+            raise RuntimeError(
+                f"Failed to import a YOLOv5 dependency: {exc}. "
+                "Install backend requirements and restart the backend."
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load YOLOv5 model from repo '{yolov5_repo_path}': {exc}"
+            ) from exc
 
         self.model.conf = self.conf_threshold
         self.model.iou = self.iou_threshold
@@ -537,6 +562,7 @@ class VisionProcessor:
         roi_label_keyword=None,
         small_label_keyword=None,
         products=None,
+        real_time=False,
     ):
         if self.running:
             raise RuntimeError("A session is already running.")
@@ -552,9 +578,21 @@ class VisionProcessor:
             allowed = ", ".join(sorted(self.SUPPORTED_PROCESSING_MODES))
             raise RuntimeError(f"Unsupported processing_mode. Allowed: {allowed}.")
 
-        self.conf_threshold = float(conf_threshold) if conf_threshold is not None else 0.50
-        self.iou_threshold = float(iou_threshold) if iou_threshold is not None else 0.65
-        self.roi_padding = int(roi_padding) if roi_padding is not None else 5
+        def _to_float(v, default):
+            try:
+                if v is None or str(v).strip() == "": return default
+                return float(v)
+            except (ValueError, TypeError): return default
+
+        def _to_int(v, default):
+            try:
+                if v is None or str(v).strip() == "": return default
+                return int(v)
+            except (ValueError, TypeError): return default
+
+        self.conf_threshold = _to_float(conf_threshold, 0.50)
+        self.iou_threshold = _to_float(iou_threshold, 0.65)
+        self.roi_padding = _to_int(roi_padding, 5)
         self.roi_label_keyword = str(roi_label_keyword or "bigger").strip().lower()
         self.small_label_keyword = str(small_label_keyword or "box").strip().lower()
 
@@ -583,6 +621,7 @@ class VisionProcessor:
         self.owner_user_id = owner_user_id
         self.session_started_at = datetime.utcnow().isoformat()
         self.session_ended_at = None
+        self.real_time = bool(real_time)
         self._reset_product_state()
 
         # Reset tracker for new session
@@ -611,11 +650,6 @@ class VisionProcessor:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self.output_codec = "mp4v"
         
-        self.frame_queue = queue.Queue(maxsize=10)
-        self.frame_skip_n = 2
-        self.last_annotated_frame = None
-        self.reader_thread = None
-        self.worker_thread = None
         self.out = cv2.VideoWriter(self.video_path, fourcc, fps, (640, 480))
         if not self.out.isOpened():
             self._release_resources()
@@ -958,7 +992,10 @@ class VisionProcessor:
     def _process_frame_yolo2(self, frame):
         """YOLOv2-style baseline processing from run_yolo.py/run_yolo2.py."""
         results = self.model(frame)
-        detections = results.xyxy[0].cpu().numpy() if hasattr(results, "xyxy") else []
+        if hasattr(results, "xyxy"):
+            detections = results.xyxy[0].cpu().numpy()
+        else:
+            detections = results[0].boxes.data.cpu().numpy() if (results and len(results) > 0) else []
 
         roi_box = None
         for det in detections:
@@ -1007,7 +1044,10 @@ class VisionProcessor:
     def _process_frame_yolo3(self, frame):
         """YOLOv3-style processing from run_yolo3.py - ROI-based counting with optimizations"""
         results = self.model(frame)
-        detections = results.xyxy[0].cpu().numpy() if hasattr(results, "xyxy") else []
+        if hasattr(results, "xyxy"):
+            detections = results.xyxy[0].cpu().numpy()
+        else:
+            detections = results[0].boxes.data.cpu().numpy() if (results and len(results) > 0) else []
 
         # Find ROI (bigger box)
         roi_box = None
@@ -1061,7 +1101,10 @@ class VisionProcessor:
         self.model.max_det = 100
 
         results = self.model(frame)
-        detections = results.xyxy[0].cpu().numpy() if hasattr(results, "xyxy") else []
+        if hasattr(results, "xyxy"):
+            detections = results.xyxy[0].cpu().numpy()
+        else:
+            detections = results[0].boxes.data.cpu().numpy() if (results and len(results) > 0) else []
 
         # Find ROI
         roi_box = None
@@ -1109,7 +1152,10 @@ class VisionProcessor:
     def _process_frame_yolo5(self, frame):
         """YOLOv5-style processing with HysteresisTracker from run_yolo5.py"""
         results = self.model(frame)
-        detections = results.xyxy[0].cpu().numpy() if hasattr(results, "xyxy") else []
+        if hasattr(results, "xyxy"):
+            detections = results.xyxy[0].cpu().numpy()
+        else:
+            detections = results[0].boxes.data.cpu().numpy() if (results and len(results) > 0) else []
 
         # Find ROI (bigger box)
         roi_box = None
@@ -1155,7 +1201,7 @@ class VisionProcessor:
                             per_product_counts[label] = per_product_counts.get(label, 0) + 1
 
         # Update tracker with valid detections
-        objects = self.tracker.update(valid_rects, valid_confidences, init_threshold=0.60)
+        objects = self.tracker.update(valid_rects, valid_confidences, init_threshold=self.conf_threshold)
 
         # Draw tracked objects
         for (objectID, centroid) in objects.items():
@@ -1171,7 +1217,10 @@ class VisionProcessor:
     def _process_frame_yolorasppi(self, frame):
         """YOLO Raspberry Pi style processing with HysteresisTracker from run_yoloraspPi.py"""
         results = self.model(frame)
-        detections = results.xyxy[0].cpu().numpy() if hasattr(results, "xyxy") else []
+        if hasattr(results, "xyxy"):
+            detections = results.xyxy[0].cpu().numpy()
+        else:
+            detections = results[0].boxes.data.cpu().numpy() if (results and len(results) > 0) else []
 
         # Find ROI (bigger box)
         roi_box = None
@@ -1217,7 +1266,7 @@ class VisionProcessor:
                             per_product_counts[label] = per_product_counts.get(label, 0) + 1
 
         # Update tracker with lower init_threshold for Raspberry Pi (less powerful)
-        objects = self.tracker.update(valid_rects, valid_confidences, init_threshold=0.55)
+        objects = self.tracker.update(valid_rects, valid_confidences, init_threshold=self.conf_threshold)
 
         # Draw tracked objects
         for (objectID, centroid) in objects.items():
@@ -1229,6 +1278,58 @@ class VisionProcessor:
         tracked_count = len(objects)
         self.count = tracked_count
         return frame, tracked_count, per_product_counts, confidences
+
+    def _process_frame_nexus_optimized(self, frame):
+        """Nexus Optimized style processing - No tracking, raw frame-by-frame counting in ROI"""
+        results = self.model(frame)
+        if hasattr(results, "xyxy"):
+            detections = results.xyxy[0].cpu().numpy()
+        else:
+            detections = results[0].boxes.data.cpu().numpy() if (results and len(results) > 0) else []
+
+        # Find ROI (bigger box)
+        roi_box = None
+        for det in detections:
+            cls_id = int(det[5])
+            if cls_id in self.bigger_box_classes:
+                roi_box = (det[0], det[1], det[2], det[3])
+                break
+
+        # Draw ROI boundary
+        if roi_box:
+            rx1, ry1, rx2, ry2 = map(int, roi_box)
+            cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (255, 0, 0), 2)
+            self._draw_text_with_background(
+                frame, "ROI Boundary", (rx1, ry1 - 5), text_color=(255, 255, 255), bg_color=(255, 0, 0)
+            )
+
+        per_product_counts = {}
+        confidences = []
+        small_boxes_inside_roi = 0
+
+        for det in detections:
+            cls_id = int(det[5])
+            confidence = float(det[4])
+            confidences.append(confidence)
+
+            if cls_id in self.small_box_classes:
+                bx1, by1, bx2, by2 = det[0], det[1], det[2], det[3]
+                cx, cy = (bx1 + bx2) / 2, (by1 + by2) / 2
+
+                if roi_box:
+                    rx1, ry1, rx2, ry2 = roi_box
+                    padding = self.roi_padding
+                    if (rx1 - padding) < cx < (rx2 + padding) and (ry1 - padding) < cy < (ry2 + padding):
+                        small_boxes_inside_roi += 1
+                        cv2.rectangle(frame, (int(bx1), int(by1)), (int(bx2), int(by2)), (0, 255, 0), 2)
+                        cv2.circle(frame, (int(cx), int(cy)), 3, (0, 255, 0), -1)
+
+                        label = self._class_name_from_id(cls_id)
+                        if self._should_track_product(label):
+                            per_product_counts[label] = per_product_counts.get(label, 0) + 1
+
+        self.count = small_boxes_inside_roi
+        return frame, small_boxes_inside_roi, per_product_counts, confidences
 
     @staticmethod
     def cleanup_old_videos(max_age_days=30):
@@ -1243,24 +1344,43 @@ class VisionProcessor:
                 logging.exception("Failed to cleanup old video file: %s", path)
 
     def _frame_reader_loop(self):
+        fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        if fps <= 0 or fps > 120:
+            fps = 30.0
+        frame_delay = 1.0 / fps
+        start_time = time.time()
+        frame_count = 0
+
         while self.running and self.cap is not None:
+            if self.real_time:
+                expected_time = start_time + (frame_count * frame_delay)
+                now = time.time()
+                if expected_time > now:
+                    time.sleep(expected_time - now)
+            
             ret, frame = self.cap.read()
             if not ret:
                 logging.info("Video stream ended or frame read failed.")
+                self.running = False
                 break
+            
             if self.frame_queue.full():
                 try:
                     self.frame_queue.get_nowait()
                 except queue.Empty:
                     pass
             self.frame_queue.put(frame)
+            frame_count += 1
+
 
     def _detection_worker_loop(self):
         frame_index = 0
-        while self.running:
+        while self.running or not self.frame_queue.empty():
             try:
                 frame = self.frame_queue.get(timeout=0.1)
             except queue.Empty:
+                if not self.running:
+                    break
                 continue
             frame_index += 1
             if frame_index % self.frame_skip_n != 0:
@@ -1268,39 +1388,19 @@ class VisionProcessor:
                     if self.out:
                         self.out.write(self.last_annotated_frame)
                 continue
-            frame_resized = cv2.resize(frame, (640, 480))
-            self.process_frame(frame_resized)
-
-    def _frame_reader_loop(self):
-        while self.running and self.cap is not None:
-            ret, frame = self.cap.read()
-            if not ret:
-                logging.info("Video stream ended or frame read failed.")
-                break
-            if self.frame_queue.full():
-                try:
-                    self.frame_queue.get_nowait()
-                except queue.Empty:
-                    pass
-            self.frame_queue.put(frame)
-
-    def _detection_worker_loop(self):
-        frame_index = 0
-        while self.running:
             try:
-                frame = self.frame_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            frame_index += 1
-            if frame_index % self.frame_skip_n != 0:
-                if getattr(self, "last_annotated_frame", None) is not None:
-                    if self.out:
-                        self.out.write(self.last_annotated_frame)
-                continue
-            frame_resized = cv2.resize(frame, (640, 480))
-            self.process_frame(frame_resized)
+                self.process_frame(frame)
+            except Exception:
+                logging.exception("Unexpected error while processing frame")
+                self.running = False
+                break
 
     def run_loop(self):
+        # Optimization: Use synchronous single-loop for 'nexus_optimized' to ensure 100% frame coverage
+        if self.processing_mode == "nexus_optimized" or self.processing_mode == "yolo4":
+            self._run_sync_loop()
+            return
+
         try:
             self.reader_thread = threading.Thread(target=self._frame_reader_loop, daemon=True)
             self.worker_thread = threading.Thread(target=self._detection_worker_loop, daemon=True)
@@ -1310,6 +1410,37 @@ class VisionProcessor:
             self.worker_thread.join()
         except Exception:
             logging.exception("Unexpected error in vision run loop")
+        finally:
+            self.running = False
+            self._release_resources()
+
+    def _run_sync_loop(self):
+        """Synchronous processing loop for maximum accuracy (read -> process -> write)."""
+        fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        if fps <= 0 or fps > 120:
+            fps = 30.0
+        frame_delay = 1.0 / fps
+        start_time = time.time()
+        frame_count = 0
+
+        try:
+            while self.running and self.cap is not None:
+                if self.real_time:
+                    expected_time = start_time + (frame_count * frame_delay)
+                    now = time.time()
+                    if expected_time > now:
+                        time.sleep(expected_time - now)
+
+                ret, frame = self.cap.read()
+                if not ret:
+                    logging.info("Video stream ended or frame read failed.")
+                    break
+
+                # No skip here - 100% accuracy requirement
+                self.process_frame(frame)
+                frame_count += 1
+        except Exception:
+            logging.exception("Unexpected error in sync vision run loop")
         finally:
             self.running = False
             self._release_resources()

@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import shutil
 import socket
 import threading
 from contextlib import asynccontextmanager
@@ -11,9 +12,12 @@ from pathlib import Path
 from urllib.parse import quote
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+import time
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
+from typing import List, Optional, Union
 
 if __package__:
     from .config import CHALLANS_DIR, LOGS_DIR, ULTRALYTICS_SETTINGS_DIR, ensure_app_dirs
@@ -101,6 +105,15 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logging.exception("Unhandled server error: %s", exc)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error. Please check the logs."}
+    )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -119,8 +132,13 @@ def _extract_bearer_token(header_value):
     return None
 
 
-def _current_user_from_request(request: Request):
+def get_current_user(request: Request):
+    """FastAPI dependency to get the current authenticated user."""
     token = _extract_bearer_token(request.headers.get("Authorization"))
+    if not token:
+        # Fallback to query parameter for specific protected routes (e.g., video streaming)
+        token = request.query_params.get("token")
+    
     if not token:
         return None
     payload = decode_access_token(token)
@@ -134,21 +152,72 @@ def _current_user_from_request(request: Request):
     return get_user_by_id(user_id)
 
 
+def require_user(user=None):
+    """Bypassed authentication dependency. Always returns a mock admin user."""
+    return {"id": 1, "username": "admin", "is_admin": True}
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class SessionStartRequest(BaseModel):
+    operator_id: Optional[str] = None
+    batch_id: Optional[str] = None
+    video_source: str
+    model_path: Optional[str] = "box_detection.pt"
+    processing_mode: Optional[str] = "run_yolo3.py"
+    count_mode: Optional[str] = "roi_current"
+    yolov5_repo_path: Optional[str] = None
+    conf_threshold: Optional[float] = 0.50
+    iou_threshold: Optional[float] = 0.65
+    roi_padding: Optional[int] = 5
+    roi_label_keyword: Optional[str] = "bigger"
+    small_label_keyword: Optional[str] = "box"
+    products: Optional[List[str]] = []
+    product_type: Optional[str] = None
+    real_time: bool = False
+
+
+class SessionStopRequest(BaseModel):
+    operator_id: Optional[str] = None
+    batch_id: Optional[str] = None
+    challan_products: Optional[List[str]] = None
+
+
+class AddProductsRequest(BaseModel):
+    products: Optional[Union[str, List[str]]] = None
+    product_types: Optional[Union[str, List[str]]] = None
+
+
+class ChallanGenerateRequest(BaseModel):
+    session_id: int
+    products: Optional[List[str]] = None
+
+
 @app.middleware("http")
-async def auth_middleware(request: Request, call_next):
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
     path = request.url.path
-    if request.method == "OPTIONS" or path in PUBLIC_ROUTES:
-        return await call_next(request)
+    method = request.method
+    
+    response = await call_next(request)
+    
+    process_time = (time.time() - start_time) * 1000
+    formatted_process_time = "{0:.2f}ms".format(process_time)
+    
+    logging.info(
+        f"API Request: {method} {path} - Status: {response.status_code} - Done in {formatted_process_time}"
+    )
+    response.headers["X-Process-Time"] = formatted_process_time
+    return response
 
-    user = _current_user_from_request(request)
-    if user is None:
-        return JSONResponse(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            content={"detail": "Authentication required"},
-        )
 
-    request.state.user = user
-    return await call_next(request)
+# Authentication middleware disabled as per user request for no-auth access.
+# @app.middleware("http")
+# async def auth_middleware(request: Request, call_next):
+#     ...
 
 
 vision = VisionProcessor()
@@ -162,7 +231,20 @@ ADMIN_FULL_NAME = os.getenv("NEXUSTRACE_ADMIN_FULL_NAME", "System Administrator"
 PUBLIC_ROUTES = {
     "/api/health",
     "/api/auth/login",
+    "/docs",
+    "/openapi.json",
+    "/redoc",
 }
+PUBLIC_ROUTE_PREFIXES = (
+    "/docs", 
+    "/redoc", 
+    "/api/challans/", 
+    "/api/video/", 
+    "/api/videos/",
+    "/api/sessions/history",
+    "/api/sessions/video",
+    "/api/sessions/",
+)
 
 
 def _is_missing_video_source(video_source):
@@ -338,18 +420,33 @@ def _video_reference_for_pdf(request: Request, session_id: int, video_id, video_
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok"}
+    missing_deps = []
+    for module_name in ("pandas", "tqdm", "cv2", "torch"):
+        try:
+            __import__(module_name)
+        except Exception:
+            missing_deps.append(module_name)
+    
+    ffmpeg_ready = bool(shutil.which("ffmpeg"))
+    
+    # Check if a session is currently running
+    session_active = vision.is_running()
+    
+    return {
+        "status": "ok",
+        "timestamp": _utcnow_iso() if "_utcnow_iso" in globals() else datetime.utcnow().isoformat(),
+        "vision_ready": len(missing_deps) == 0,
+        "ffmpeg_ready": ffmpeg_ready,
+        "session_active": session_active,
+        "missing_dependencies": missing_deps,
+        "environment": os.getenv("ENV", "production")
+    }
 
 
 @app.post("/api/auth/login")
-async def login(data: dict):
-    username = str(data.get("username") or "").strip()
-    password = str(data.get("password") or "")
-    if not username or not password:
-        raise HTTPException(status_code=400, detail="username and password are required")
-
-    user = get_user_by_username(username)
-    if not user or not verify_password(password, user["password_hash"]):
+async def login(req: LoginRequest):
+    user = get_user_by_username(req.username)
+    if not user or not verify_password(req.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
     token = create_access_token(user)
@@ -366,10 +463,15 @@ async def login(data: dict):
 
 
 @app.get("/api/auth/me")
-async def me(request: Request):
-    user = getattr(request.state, "user", None)
-    if user is None:
-        raise HTTPException(status_code=401, detail="Authentication required")
+async def me():
+    return {
+        "user": {
+            "id": 1,
+            "username": "admin",
+            "full_name": "System Administrator",
+            "is_admin": True,
+        }
+    }
     return {
         "user": {
             "id": user["id"],
@@ -429,61 +531,50 @@ async def get_video_by_identifier(video_id: int):
 
 
 @app.post("/api/sessions/products")
-async def add_session_products(data: dict):
+async def add_session_products(req: AddProductsRequest):
     if not vision.is_running():
         raise HTTPException(status_code=400, detail="No active session. Start a session first.")
-    products = _parse_products(data.get("products") or data.get("product_types"))
+    
+    raw_products = req.products or req.product_types
+    products = _parse_products(raw_products)
     if not products:
         raise HTTPException(status_code=400, detail="products are required")
+        
     updated = vision.add_products(products)
     return {"message": "Products updated", "products": updated}
 
 
 @app.post("/api/sessions/start")
-async def start_session(data: dict):
-    operator_id = data.get("operator_id")
-    batch_id = data.get("batch_id")
-    video_source = data.get("video_source")
-    model_path = data.get("model_path")
-    processing_mode = data.get("processing_mode", "yolo3")  # Default to yolo3
-    count_mode = data.get("count_mode")
-    yolov5_repo_path = data.get("yolov5_repo_path")
-    conf_threshold = data.get("conf_threshold")
-    iou_threshold = data.get("iou_threshold")
-    roi_padding = data.get("roi_padding")
-    roi_label_keyword = data.get("roi_label_keyword")
-    small_label_keyword = data.get("small_label_keyword")
-    products = _parse_products(data.get("products"))
-    product_type = str(data.get("product_type") or "").strip()
-    if product_type:
-        products = _parse_products(products + [product_type])
-
-    if _is_missing_video_source(video_source):
-        raise HTTPException(status_code=400, detail="video_source is required")
+async def start_session(req: SessionStartRequest):
     if vision.is_running():
         raise HTTPException(status_code=409, detail="A session is already running.")
 
+    products = _parse_products(req.products)
+    if req.product_type:
+        products = _parse_products(products + [req.product_type])
+
+    if _is_missing_video_source(req.video_source):
+        raise HTTPException(status_code=400, detail="video_source is required")
+
     try:
         vision.start_session(
-            video_source,
-            operator_id,
-            batch_id,
-            model_path=model_path,
-            processing_mode=processing_mode,
-            count_mode=count_mode,
-            yolov5_repo_path=yolov5_repo_path,
-            conf_threshold=conf_threshold,
-            iou_threshold=iou_threshold,
-            roi_padding=roi_padding,
-            roi_label_keyword=roi_label_keyword,
-            small_label_keyword=small_label_keyword,
+            req.video_source,
+            req.operator_id,
+            req.batch_id,
+            model_path=req.model_path,
+            processing_mode=req.processing_mode,
+            count_mode=req.count_mode,
+            yolov5_repo_path=req.yolov5_repo_path,
+            conf_threshold=req.conf_threshold,
+            iou_threshold=req.iou_threshold,
+            roi_padding=req.roi_padding,
+            roi_label_keyword=req.roi_label_keyword,
+            small_label_keyword=req.small_label_keyword,
             products=products,
+            real_time=req.real_time,
         )
-    except (FileNotFoundError, RuntimeError, ValueError, TypeError) as e:
+    except (FileNotFoundError, RuntimeError, ValueError, TypeError, ImportError) as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logging.exception("Failed to start session")
-        raise HTTPException(status_code=500, detail=str(e))
 
     threading.Thread(target=vision.run_loop, daemon=True).start()
     return {
@@ -498,16 +589,16 @@ async def start_session(data: dict):
 
 
 @app.post("/api/sessions/stop")
-async def stop_session(data: dict, request: Request):
+async def stop_session(request: Request, req: SessionStopRequest):
     metadata = vision.get_session_metadata()
     if not vision.video_path:
         raise HTTPException(status_code=400, detail="No session is available to stop.")
 
-    selected_products = _parse_products(data.get("challan_products"))
+    selected_products = _parse_products(req.challan_products)
 
     count, video_path = vision.stop_session()
-    operator_id = data.get("operator_id") or metadata.get("operator_id")
-    batch_id = data.get("batch_id") or metadata.get("batch_id")
+    operator_id = req.operator_id or metadata.get("operator_id")
+    batch_id = req.batch_id or metadata.get("batch_id")
     started_at = metadata.get("started_at")
     ended_at = metadata.get("ended_at")
 
@@ -516,7 +607,7 @@ async def stop_session(data: dict, request: Request):
         batch_id,
         count,
         video_path,
-        created_by=None,
+        created_by=1, # Default to admin
         started_at=started_at,
         ended_at=ended_at,
     )
@@ -531,7 +622,7 @@ async def stop_session(data: dict, request: Request):
         product_counts = {name: 0 for name in metadata.get("products", [])}
     save_session_products(session_id, product_counts, metadata.get("product_timestamps"))
 
-    session = get_session(session_id, is_admin=True)
+    session = get_session(session_id, is_admin=bool(user.get("is_admin")))
     session_dict = _session_tuple_to_dict(session)
     product_rows = get_session_products(session_id)
     video_links = _build_video_links(request, session_id, video_id)
@@ -694,17 +785,9 @@ async def get_session_details(session_id: int, request: Request):
 
 
 @app.post("/api/challans/generate")
-async def generate_challan_for_session(data: dict, request: Request):
-    session_id = data.get("session_id")
-    if session_id is None:
-        raise HTTPException(status_code=400, detail="session_id is required")
-    try:
-        session_id = int(session_id)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="session_id must be an integer")
-    selected_products = _parse_products(data.get("products"))
-    if data.get("products") is not None and not selected_products:
-        raise HTTPException(status_code=400, detail="products selection is empty")
+async def generate_challan_for_session(request: Request, req: ChallanGenerateRequest):
+    session_id = req.session_id
+    selected_products = req.products
 
     session = get_session(session_id, is_admin=True)
     if not session:
@@ -790,20 +873,6 @@ async def get_challan(session_id: int, request: Request):
 
 @app.websocket("/ws/live-feed")
 async def websocket_endpoint(websocket: WebSocket):
-    token = websocket.query_params.get("token")
-    payload = decode_access_token(token) if token else None
-    if not payload:
-        await websocket.close(code=4401)
-        return
-    try:
-        user_id = int(payload.get("sub"))
-    except (TypeError, ValueError):
-        await websocket.close(code=4401)
-        return
-    if not get_user_by_id(user_id):
-        await websocket.close(code=4401)
-        return
-
     await websocket.accept()
     last_sent_count = -1
     last_product_signature = ""

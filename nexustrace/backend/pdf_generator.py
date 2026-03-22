@@ -202,6 +202,13 @@ def generate_challan(
     pdf.cell(50, 8, "", border=1, ln=True)
 
     pdf.ln(10)
+    if video_reference_url:
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.set_text_color(0, 0, 255)
+        pdf.cell(0, 6, f"Video Evidence: {video_reference_url}", ln=True, link=video_reference_url)
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(2)
+
     pdf.set_font("Helvetica", "I", 9)
     pdf.multi_cell(0, 6, "System Generated Document. Signature: __________________________")
 

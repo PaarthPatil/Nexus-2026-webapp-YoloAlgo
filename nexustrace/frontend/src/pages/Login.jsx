@@ -51,21 +51,18 @@ export function Login() {
               label="Username" 
               placeholder="admin"
               value={username}
-              onChange={(e) => setUsername(e.target.value)}
+              onChange={setUsername}
               disabled={loading}
               autoComplete="username"
             />
-            <div className="space-y-1">
-              <label className="block text-xs uppercase tracking-wider text-slate-400 font-medium">Password</label>
-              <input 
-                type="password"
-                className="flex h-9 w-full rounded-md border border-slate-700 bg-slate-950/50 px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-500 disabled:opacity-50 text-slate-100"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                disabled={loading}
-                autoComplete="current-password"
-              />
-            </div>
+            <Input
+              type="password"
+              label="Password"
+              value={password}
+              onChange={setPassword}
+              disabled={loading}
+              autoComplete="current-password"
+            />
             {error && <p className="text-sm font-medium text-red-400 bg-red-950/30 p-2 text-center rounded border border-red-900/50">{error}</p>}
           </CardContent>
           <CardFooter>

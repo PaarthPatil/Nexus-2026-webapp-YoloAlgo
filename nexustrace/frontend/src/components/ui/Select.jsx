@@ -1,8 +1,9 @@
 import React, { forwardRef } from 'react';
-import { cn } from '../lib/utils';
+import { cn } from '../../lib/utils';
 import { ChevronDown } from 'lucide-react';
 
-export const Select = forwardRef(({ className, label, options, error, ...props }, ref) => {
+export const Select = forwardRef(({ className, label, options, error, onChange, ...props }, ref) => {
+  const handleChange = onChange ? (e) => onChange(e.target.value) : undefined;
   return (
     <div className="w-full relative">
       {label && (
@@ -18,6 +19,7 @@ export const Select = forwardRef(({ className, label, options, error, ...props }
             className
           )}
           ref={ref}
+          onChange={handleChange}
           {...props}
         >
           {options?.map((opt) => (

@@ -1,12 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth, API_PREFIX } from '../context/AuthContext';
 import { useSession } from '../context/SessionContext';
-import { Card, CardContent, CardHeader, CardTitle, CardDescription, CardFooter } from '../components/ui/Card';
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../components/ui/Card';
 import { Input } from '../components/ui/Input';
 import { Select } from '../components/ui/Select';
 import { Button } from '../components/ui/Button';
 import { ChevronDown, Play, Settings2, PlusCircle } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
+import { readApiError, safeOpenInNewTab } from '../lib/api';
 
 const DEFAULT_PROCESSING_OPTIONS = [
   { value: 'run_yolo.py', label: 'run_yolo.py (YOLOv2 Baseline)' },
@@ -17,9 +18,25 @@ const DEFAULT_PROCESSING_OPTIONS = [
   { value: 'run_yoloraspPi.py', label: 'run_yoloraspPi.py (Raspberry Pi)' }
 ];
 
+const parseFloatSetting = (value, label, { min = Number.NEGATIVE_INFINITY, max = Number.POSITIVE_INFINITY } = {}) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < min || parsed > max) {
+    throw new Error(`${label} must be a number between ${min} and ${max}.`);
+  }
+  return parsed;
+};
+
+const parseIntegerSetting = (value, label, { min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER } = {}) => {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+    throw new Error(`${label} must be a whole number between ${min} and ${max}.`);
+  }
+  return parsed;
+};
+
 export function SessionSetup() {
   const { apiFetch } = useAuth();
-  const { isRunning, operatorId, setOperatorId, batchId, setBatchId, fetchCurrentSession, sessionProducts, setSessionProducts } = useSession();
+  const { isRunning, operatorId, setOperatorId, batchId, setBatchId, fetchCurrentSession, sessionProducts } = useSession();
   const navigate = useNavigate();
 
   const [videoSource, setVideoSource] = useState('');
@@ -62,7 +79,9 @@ export function SessionSetup() {
           value: item.path, label: item.name || item.path
         }));
         setModelOptions(nextModelOptions);
-      } catch (err) {}
+      } catch (err) {
+        console.error('Failed to fetch session setup options', err);
+      }
     };
     fetchSessionOptions();
   }, [apiFetch]);
@@ -83,6 +102,16 @@ export function SessionSetup() {
     const parsedProducts = parseProducts(productsInput);
     
     try {
+      const nextConfThreshold = countMode === 'roi_current'
+        ? parseFloatSetting(confThreshold, 'Confidence threshold', { min: 0, max: 1 })
+        : null;
+      const nextIouThreshold = countMode === 'roi_current'
+        ? parseFloatSetting(iouThreshold, 'IOU threshold', { min: 0, max: 1 })
+        : null;
+      const nextRoiPadding = countMode === 'roi_current'
+        ? parseIntegerSetting(roiPadding, 'ROI padding', { min: 0, max: 500 })
+        : null;
+
       const res = await apiFetch(`${API_PREFIX}/sessions/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -94,16 +123,16 @@ export function SessionSetup() {
           processing_mode: processingMode,
           count_mode: countMode,
           yolov5_repo_path: yolov5RepoPath || null,
-          conf_threshold: countMode === 'roi_current' ? Number(confThreshold) : null,
-          iou_threshold: countMode === 'roi_current' ? Number(iouThreshold) : null,
-          roi_padding: countMode === 'roi_current' ? Number(roiPadding) : null,
+          conf_threshold: nextConfThreshold,
+          iou_threshold: nextIouThreshold,
+          roi_padding: nextRoiPadding,
           roi_label_keyword: countMode === 'roi_current' ? roiLabelKeyword : null,
           small_label_keyword: countMode === 'roi_current' ? smallLabelKeyword : null,
           product_type: parsedProducts[0] || null,
           products: parsedProducts
         })
       });
-      if (!res.ok) throw new Error('Failed to start session');
+      if (!res.ok) throw new Error(await readApiError(res, 'Failed to start session'));
       await fetchCurrentSession();
       navigate('/');
     } catch (err) {
@@ -126,11 +155,11 @@ export function SessionSetup() {
           challan_products: selected.length ? selected : null
         })
       });
-      if (!res.ok) throw new Error('Failed to stop session');
+      if (!res.ok) throw new Error(await readApiError(res, 'Failed to stop session'));
       const data = await res.json();
       await fetchCurrentSession();
       if (data.challan_file) {
-        window.open(`${API_PREFIX}/challans/files/${encodeURIComponent(data.challan_file)}`, '_blank');
+        safeOpenInNewTab(`${API_PREFIX}/challans/files/${encodeURIComponent(data.challan_file)}`);
       }
     } catch (err) {
       setError(err.message || 'Error halting the session.');
@@ -139,18 +168,23 @@ export function SessionSetup() {
 
   const handleAddLiveProducts = async () => {
     const parsed = parseProducts(addProductsInput);
-    if (!parsed.length) return;
+    if (!parsed.length) {
+      setError('Enter at least one product name before injecting.');
+      return;
+    }
     try {
+      setError('');
       const res = await apiFetch(`${API_PREFIX}/sessions/products`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ products: parsed })
       });
-      if (res.ok) {
-        setAddProductsInput('');
-        fetchCurrentSession();
-      }
-    } catch (e) {}
+      if (!res.ok) throw new Error(await readApiError(res, 'Failed to add products'));
+      setAddProductsInput('');
+      fetchCurrentSession();
+    } catch (e) {
+      setError(e.message || 'Failed to add live products.');
+    }
   };
 
   return (
@@ -217,13 +251,20 @@ export function SessionSetup() {
                   value={countMode} 
                   onChange={(e) => setCountMode(e)} 
                 />
-                
+                <Input
+                  label="YOLOv5 Repo Path (optional)"
+                  placeholder="D:/Nexus/yolov5"
+                  value={yolov5RepoPath}
+                  onChange={(e) => setYolov5RepoPath(e)}
+                />
+                 
                 {countMode === 'roi_current' && (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 bg-slate-950/50 p-4 rounded-lg border border-slate-800">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-4 bg-slate-950/50 p-4 rounded-lg border border-slate-800">
                     <Input label="Conf" value={confThreshold} onChange={(e) => setConfThreshold(e)} />
                     <Input label="IOU" value={iouThreshold} onChange={(e) => setIouThreshold(e)} />
                     <Input label="Pad" value={roiPadding} onChange={(e) => setRoiPadding(e)} />
                     <Input label="ROI Key" value={roiLabelKeyword} onChange={(e) => setRoiLabelKeyword(e)} />
+                    <Input label="Small Key" value={smallLabelKeyword} onChange={(e) => setSmallLabelKeyword(e)} />
                   </div>
                 )}
               </div>
@@ -231,6 +272,15 @@ export function SessionSetup() {
           </Card>
 
           {error && <div className="p-3 bg-red-950/40 border border-red-900/50 text-red-400 text-sm rounded-lg">{error}</div>}
+
+          {isRunning && (
+            <Input
+              label="Challan Products (optional, comma separated)"
+              placeholder="Leave empty for all products"
+              value={challanProductsInput}
+              onChange={(e) => setChallanProductsInput(e)}
+            />
+          )}
 
           <div className="flex items-center gap-3">
             <Button type="submit" size="lg" disabled={isRunning} isLoading={loading} className="flex-1 bg-emerald-600 hover:bg-emerald-700 shadow-emerald-900/20">

@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { useAuth, API_PREFIX } from './AuthContext';
 
@@ -46,7 +47,9 @@ export function SessionProvider({ children }) {
         if (data.detection_confidence !== undefined) setConfidence(Number(data.detection_confidence || 0));
         if (data.duration_seconds !== undefined) setSessionDuration(Number(data.duration_seconds || 0));
         if (data.is_running !== undefined) setIsRunning(Boolean(data.is_running));
-      } catch (_) {}
+      } catch (_err) {
+        // Ignore malformed websocket payloads and keep stream alive.
+      }
     };
 
     ws.onclose = () => {
@@ -77,7 +80,9 @@ export function SessionProvider({ children }) {
       setSessionProducts(session.products || []);
       if (session.operator_id) setOperatorId(session.operator_id);
       if (session.batch_id) setBatchId(session.batch_id);
-    } catch (_) {}
+    } catch (_err) {
+      // Keep existing UI state when polling fails briefly.
+    }
   }, [apiFetch, currentUser]);
 
   useEffect(() => {

@@ -1,7 +1,7 @@
 import React from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { useSession } from '../../context/SessionContext';
-import { LogOut, Activity, Clock } from 'lucide-react';
+import { LogOut, Clock } from 'lucide-react';
 import { Button } from '../ui/Button';
 
 const formatDuration = (seconds) => {

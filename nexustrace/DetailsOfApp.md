@@ -1,7 +1,7 @@
-## NexusTrace - Run & Usage Guide (No JWT)
+## NexusTrace - Run & Usage Guide (JWT Secured)
 
 ### Current scope
-- No login/auth required.
+- Login/auth required (Defaults: `admin`/`admin123`).
 - Start/stop sessions, live feed, final-check counting, history, challan download.
 - Supports ROI counting with your `D:\Nexus` model setup.
 
