@@ -94,22 +94,25 @@ export function SessionProvider({ children }) {
     };
   }, [fetchCurrentSession, closeWebSocket]);
 
+  const contextValue = React.useMemo(() => ({
+    isRunning, setIsRunning,
+    count, setCount,
+    fps, setFps,
+    confidence, setConfidence,
+    sessionDuration, setSessionDuration,
+    sessionProducts, setSessionProducts,
+    productCounts, setProductCounts,
+    imageSrc, setImageSrc,
+    operatorId, setOperatorId,
+    batchId, setBatchId,
+    fetchCurrentSession
+  }), [
+    isRunning, count, fps, confidence, sessionDuration, sessionProducts, 
+    productCounts, imageSrc, operatorId, batchId, fetchCurrentSession
+  ]);
+
   return (
-    <SessionContext.Provider
-      value={{
-        isRunning, setIsRunning,
-        count, setCount,
-        fps, setFps,
-        confidence, setConfidence,
-        sessionDuration, setSessionDuration,
-        sessionProducts, setSessionProducts,
-        productCounts, setProductCounts,
-        imageSrc, setImageSrc,
-        operatorId, setOperatorId,
-        batchId, setBatchId,
-        fetchCurrentSession
-      }}
-    >
+    <SessionContext.Provider value={contextValue}>
       {children}
     </SessionContext.Provider>
   );

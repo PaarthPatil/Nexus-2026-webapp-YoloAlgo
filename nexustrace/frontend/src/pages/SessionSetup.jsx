@@ -59,13 +59,15 @@ export function SessionSetup() {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [localVideos, setLocalVideos] = useState([]);
 
   useEffect(() => {
     const fetchSessionOptions = async () => {
       try {
-        const [optionsRes, settingsRes] = await Promise.all([
+        const [optionsRes, settingsRes, videosRes] = await Promise.all([
           apiFetch(`${API_PREFIX}/sessions/options`),
-          apiFetch(`${API_PREFIX}/system/settings`)
+          apiFetch(`${API_PREFIX}/system/settings`),
+          apiFetch(`${API_PREFIX}/system/local-videos`)
         ]);
 
         if (optionsRes.ok) {
@@ -90,6 +92,11 @@ export function SessionSetup() {
           if (s.default_conf_threshold) setConfThreshold(s.default_conf_threshold);
           if (s.default_iou_threshold) setIouThreshold(s.default_iou_threshold);
           if (s.default_roi_padding) setRoiPadding(s.default_roi_padding);
+        }
+
+        if (videosRes.ok) {
+          const vData = await videosRes.json();
+          setLocalVideos(vData.videos || []);
         }
       } catch (err) {
         console.error('Failed to fetch session setup options', err);
@@ -224,7 +231,13 @@ export function SessionSetup() {
                 value={videoSource} 
                 onChange={(e) => setVideoSource(e)} 
                 disabled={isRunning} 
+                list="setup-video-list"
               />
+              <datalist id="setup-video-list">
+                {localVideos.map((vid, idx) => (
+                  <option key={idx} value={vid.path}>{vid.name}</option>
+                ))}
+              </datalist>
               
               <Input 
                 label="Products to Detect (comma separated)" 
